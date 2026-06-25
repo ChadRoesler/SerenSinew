@@ -1,0 +1,64 @@
+# ========================================================================
+#  seren-sinew - the Seren shared runtime plumbing
+#  Chad owns release.yml / Trusted Publishing / dependabot wiring; this is
+#  just the package shape: deps minimal, starlette-only (already in every
+#  leaf via FastAPI, so it adds nothing to the real install).
+# ========================================================================
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seren-sinew"
+description = "The connective tissue of the Seren stack: shared runtime plumbing (request logging now; cluster client / discovery / DTOs later)."
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.10"
+dynamic = ["version"]
+keywords = ["seren", "fastapi", "starlette", "logging", "middleware"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: System :: Logging",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
+
+# Light, like Meninges: starlette only. It's already in every leaf via
+# FastAPI, so depending on it costs nothing at install time and keeps Sinew
+# FastAPI-agnostic (we import starlette.requests.Request, not fastapi.Request).
+dependencies = [
+  "starlette>=0.37",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://github.com/ChadRoesler/SerenSinew"
+Repository = "https://github.com/ChadRoesler/SerenSinew"
+"Bug Tracker" = "https://github.com/ChadRoesler/SerenSinew/issues"
+
+[tool.setuptools]
+packages = ["seren_sinew"]
+
+[tool.setuptools_scm]
+# Inner project dir under the git root, mirroring the rest of the family
+# (the package lives at SerenSinew/SerenSinew/seren_sinew, git root is SerenSinew/).
+root = ".."
+# scm writes the version into the package (gitignored); __init__ reads it via
+# importlib.metadata at runtime, with this file as the source-checkout fallback.
+version_file = "seren_sinew/_version.py"
+# Strip the leading 'v' so "v1.2.3" -> "1.2.3".
+tag_regex = "^v(?P<version>[0-9]+\\.[0-9]+\\.[0-9]+.*)$"
+# Used when no git tags exist (local dev, fresh clone, make test).
+# SETUPTOOLS_SCM_PRETEND_VERSION overrides this when set (CI release builds).
+fallback_version = "0.0.0.dev0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

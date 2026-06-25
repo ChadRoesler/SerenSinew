@@ -1,0 +1,11 @@
+# setuptools-scm writes this at build time - NEVER commit it (the rest of the
+# family gitignores it too; committing it pins a stale version into the tree).
+seren_sinew/_version.py
+
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.vs/
