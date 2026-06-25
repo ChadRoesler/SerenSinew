@@ -3,7 +3,7 @@
 #
 # Targets:
 #   make test         - fresh venv, install .[dev], run the suite (matches CI)
-#   make test-all     - alias for test (Meninges has a single [dev] leg)
+#   make test-all     - alias for test (Sinew has a single [dev] leg)
 #   make clean        - remove any leftover venvs
 #
 # Each Python target creates a fresh isolated venv, runs tests, then removes it.
@@ -12,7 +12,7 @@
 SHELL        := pwsh.exe
 .SHELLFLAGS  := -NoProfile -NonInteractive -Command
 
-PKG_DIR    := SerenMeninges
+PKG_DIR    := SerenSinew
 
 VENV_BASE  := .venv-base
 

@@ -9,9 +9,9 @@ updates:
     commit-message:
       prefix: "ci"
 
-  # Python deps for the meninges package (pyproject lives in SerenMeninges/).
+  # Python deps for the sinew package (pyproject lives in SerenSinew/).
   - package-ecosystem: "pip"
-    directory: "/SerenMeninges"
+    directory: "/SerenSinew"
     schedule:
       interval: "weekly"
     commit-message:

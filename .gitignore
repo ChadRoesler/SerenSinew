@@ -363,7 +363,7 @@ MigrationBackup/
 FodyWeavers.xsd
 
 ###############################################################################
-# Python (seren-meninges package + tooling)
+# Python (seren-sinew package + tooling)
 ###############################################################################
 # build artifacts
 build/
