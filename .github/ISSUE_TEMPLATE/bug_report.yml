@@ -29,8 +29,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: SerenMeninges version
-      placeholder: "e.g. v0.2.0  (pip show seren-meninges)"
+      label: SerenSinew version
+      placeholder: "e.g. v0.2.0  (pip show seren-sinew)"
     validations:
       required: true
 

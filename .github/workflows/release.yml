@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-        # Meninges v0.1.0 ships ONE test surface: the core (credentials /
+        # Sinew v0.1.0 ships ONE test surface: the core (credentials /
         # config / version). [keyring] is optional and the not-installed path
         # is covered by the suite itself, so [dev] is the only leg needed.
         extras: ["dev"]
@@ -36,7 +36,7 @@ jobs:
 
       - name: Install package and deps (extras = ${{ matrix.extras }})
         run: pip install -e ".[${{ matrix.extras }}]"
-        working-directory: SerenMeninges
+        working-directory: SerenSinew
         env:
           # Tests don't care about the real version; pin one so scm never has
           # to compute from history (and so a tagless branch can't trip it).
@@ -44,7 +44,7 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v
-        working-directory: SerenMeninges
+        working-directory: SerenSinew
 
   build-and-release:
     needs: [test]
@@ -67,18 +67,18 @@ jobs:
 
       - name: Build wheel and sdist
         run: python -m build
-        working-directory: SerenMeninges
+        working-directory: SerenSinew
 
       - name: Upload dist as artifact (handed to the publish job)
         uses: actions/upload-artifact@v4
         with:
-          name: seren-meninges-dist
-          path: SerenMeninges/dist/
+          name: seren-sinew-dist
+          path: SerenSinew/dist/
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: SerenMeninges/dist/*
+          files: SerenSinew/dist/*
 
   pypi-publish:
     needs: [build-and-release]
@@ -86,14 +86,14 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/seren-meninges
+      url: https://pypi.org/p/seren-sinew
     permissions:
       id-token: write   # MANDATORY for Trusted Publishing; job-level = least privilege
     steps:
       - name: Download the built dist
         uses: actions/download-artifact@v4
         with:
-          name: seren-meninges-dist
+          name: seren-sinew-dist
           path: dist/
 
       - name: Publish to PyPI (tokenless)
