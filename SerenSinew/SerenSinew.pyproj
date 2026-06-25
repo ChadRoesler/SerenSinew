@@ -1,0 +1,51 @@
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003" ToolsVersion="4.0">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <SchemaVersion>2.0</SchemaVersion>
+    <ProjectGuid>ae4e1ede-7cfb-4d56-9d60-019aaea8c812</ProjectGuid>
+    <ProjectHome>.</ProjectHome>
+    <StartupFile>
+    </StartupFile>
+    <SearchPath>
+    </SearchPath>
+    <WorkingDirectory>.</WorkingDirectory>
+    <OutputPath>.</OutputPath>
+    <Name>SerenSinew</Name>
+    <RootNamespace>SerenSinew</RootNamespace>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
+    <DebugSymbols>true</DebugSymbols>
+    <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
+    <DebugSymbols>true</DebugSymbols>
+    <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="seren_sinew\request_log.py" />
+    <Compile Include="seren_sinew\_version.py" />
+    <Compile Include="seren_sinew\__init__.py" />
+    <Compile Include="tests\test_request_log.py" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="seren_sinew\" />
+    <Folder Include="seren_sinew\__pycache__\" />
+    <Folder Include="tests\" />
+    <Folder Include="tests\__pycache__\" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="seren_sinew\__pycache__\request_log.cpython-311.pyc" />
+    <Content Include="seren_sinew\__pycache__\_version.cpython-311.pyc" />
+    <Content Include="seren_sinew\__pycache__\__init__.cpython-311.pyc" />
+    <Content Include="tests\__pycache__\test_request_log.cpython-311-pytest-9.0.3.pyc" />
+  </ItemGroup>
+  <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
+  <!-- Uncomment the CoreCompile target to enable the Build command in
+       Visual Studio and specify your pre- and post-build commands in
+       the BeforeBuild and AfterBuild targets below. -->
+  <!--<Target Name="CoreCompile" />-->
+  <Target Name="BeforeBuild">
+  </Target>
+  <Target Name="AfterBuild">
+  </Target>
+</Project>
