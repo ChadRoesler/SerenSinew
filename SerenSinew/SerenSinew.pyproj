@@ -23,21 +23,16 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="seren_sinew\request_log.py" />
-    <Compile Include="seren_sinew\_version.py" />
     <Compile Include="seren_sinew\__init__.py" />
     <Compile Include="tests\test_request_log.py" />
   </ItemGroup>
   <ItemGroup>
     <Folder Include="seren_sinew\" />
-    <Folder Include="seren_sinew\__pycache__\" />
     <Folder Include="tests\" />
-    <Folder Include="tests\__pycache__\" />
   </ItemGroup>
   <ItemGroup>
-    <Content Include="seren_sinew\__pycache__\request_log.cpython-311.pyc" />
-    <Content Include="seren_sinew\__pycache__\_version.cpython-311.pyc" />
-    <Content Include="seren_sinew\__pycache__\__init__.cpython-311.pyc" />
-    <Content Include="tests\__pycache__\test_request_log.cpython-311-pytest-9.0.3.pyc" />
+    <Content Include="pyproject.toml" />
+    <Content Include="README.md" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
