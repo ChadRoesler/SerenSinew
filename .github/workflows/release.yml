@@ -91,7 +91,7 @@ jobs:
       id-token: write   # MANDATORY for Trusted Publishing; job-level = least privilege
     steps:
       - name: Download the built dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: seren-sinew-dist
           path: dist/
