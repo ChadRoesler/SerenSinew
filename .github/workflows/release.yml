@@ -70,7 +70,7 @@ jobs:
         working-directory: SerenSinew
 
       - name: Upload dist as artifact (handed to the publish job)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: seren-sinew-dist
           path: SerenSinew/dist/
