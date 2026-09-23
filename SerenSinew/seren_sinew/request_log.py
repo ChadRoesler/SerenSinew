@@ -11,11 +11,23 @@ exactly the thing you want a single source of truth for. Meninges is the
 membrane; Sinew is the tendon.
 
 WHAT IT DOES
-  Logs every HTTP request as: "<client> <METHOD> <path> -> <status> (<ms>ms)".
-  Level by outcome: 2xx/3xx INFO, 4xx WARNING, 5xx ERROR (with full
-  traceback), and any 2xx slower than 1s gets a WARNING [slow] tag. Output
+  Logs every HTTP request as:
+      "<client> <METHOD> <path> -> <status> (<ms>ms) [rid=<id>]"
+  Level by outcome: 2xx/3xx INFO, 4xx WARNING, 5xx ERROR, and any 2xx slower
+  than 1s gets a WARNING [slow] tag. A 5xx that a route RETURNED is one
+  line; an exception that ESCAPED a route is logged with the full traceback
+  and then re-raised so the framework's own 500 handler still runs. Output
   goes to BOTH stderr (journalctl picks it up) AND a rotating file the
   running user owns at <log_dir>/<service>-requests.log.
+
+THE REQUEST ID
+  Every request gets one. If the caller sent ``X-Request-Id`` it is kept
+  (so Lodestar -> Observatory -> a service can be followed across three
+  logs by one string); otherwise a short random one is minted. Either way it
+  is on the log line and echoed back on the response as ``X-Request-Id``, so
+  a person looking at a bad reply in the browser can grep for exactly that
+  request. Cheap now, and every leaf will want it the day the cluster client
+  lands.
 
 WHY A FILE THE USER OWNS
   'sudo journalctl -u seren-*' wants a password every time. Anyone debugging
@@ -56,6 +68,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import secrets
 import time
 import traceback
 from pathlib import Path
@@ -65,6 +78,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+REQUEST_ID_HEADER = "X-Request-Id"
+#: Longest inbound id we will carry. Anything past this is not an id, it is
+#: somebody's payload trying to land in a log file.
+_MAX_REQUEST_ID = 64
+
 
 def _default_log_filename(service_name: str) -> str:
     """`seren-observatory` -> `observatory-requests.log`. Strips a leading
@@ -72,6 +90,18 @@ def _default_log_filename(service_name: str) -> str:
     name if stripping would leave nothing."""
     stem = service_name.removeprefix("seren-") or service_name
     return f"{stem}-requests.log"
+
+
+def _request_id(inbound: Optional[str]) -> str:
+    """Keep a sane inbound id; mint one otherwise. Printable ASCII only, so
+    the log line stays one line and the response header stays legal."""
+    if inbound:
+        candidate = inbound.strip()
+        if candidate and len(candidate) <= _MAX_REQUEST_ID and all(
+            33 <= ord(ch) <= 126 for ch in candidate
+        ):
+            return candidate
+    return secrets.token_hex(6)
 
 
 def setup_request_logger(
@@ -91,8 +121,8 @@ def setup_request_logger(
 
     Two handlers: a stderr StreamHandler (journalctl) and a midnight
     TimedRotatingFileHandler at <log_dir>/<log_filename> keeping backup_count
-    days. If the dir isn't writable it falls back to stderr-only rather than
-    crashing the service.
+    days. If the dir cannot be found or isn't writable it falls back to
+    stderr-only rather than crashing the service.
     """
     logger = logging.getLogger(f"{service_name}.requests")
     if logger.handlers:
@@ -111,9 +141,15 @@ def setup_request_logger(
     stream.setFormatter(fmt)
     logger.addHandler(stream)
 
-    directory = Path(log_dir) if log_dir is not None else Path.home() / "seren-logs"
     filename = log_filename or _default_log_filename(service_name)
     try:
+        # Path.home() is INSIDE the try on purpose. With HOME unset and a UID
+        # that has no passwd entry - a container run as `--user 1000` on a
+        # Jetson - pathlib raises RuntimeError, not OSError, and the old
+        # placement turned "no home directory" into a service that could not
+        # boot. No home means no file log, which is what the except already
+        # says for an unwritable one.
+        directory = Path(log_dir) if log_dir is not None else Path.home() / "seren-logs"
         directory.mkdir(parents=True, exist_ok=True)
         file_handler = logging.handlers.TimedRotatingFileHandler(
             filename=directory / filename,
@@ -123,10 +159,11 @@ def setup_request_logger(
         )
         file_handler.setFormatter(fmt)
         logger.addHandler(file_handler)
-    except OSError as e:
-        # Don't crash the service if the log dir isn't writable - degrade to
-        # stderr-only. Request lines still reach journalctl.
-        logger.warning(f"could not open file log at {directory}: {e}")
+    except (OSError, RuntimeError) as e:
+        # Don't crash the service if the log dir isn't there or isn't
+        # writable - degrade to stderr-only. Request lines still reach
+        # journalctl.
+        logger.warning(f"could not open file log for {service_name}: {e}")
 
     return logger
 
@@ -138,12 +175,14 @@ def get_logger(service_name: str, **kwargs) -> logging.Logger:
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
-    """Logs every request with timing + status; captures 5xx tracebacks.
+    """Logs every request with timing, status and a request id; captures the
+    traceback of any exception that escapes a route.
 
     Mount OUTERMOST (before auth). Wire it as::
 
+        from seren_meninges.auth import bearer_auth_middleware
         from seren_sinew.request_log import RequestLoggingMiddleware
-        app.add_middleware(BearerAuthMiddleware, expected_token=token)   # inner
+        app.add_middleware(bearer_auth_middleware(token))                # inner
         app.add_middleware(                                              # outer
             RequestLoggingMiddleware,
             service_name="seren-observatory",
@@ -182,13 +221,17 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         if os.environ.get(f"{self._env_prefix}_LOG_QUERY") == "1" and request.url.query:
             path = f"{path}?{request.url.query}"
         client = request.client.host if request.client else "?"
+        rid = _request_id(request.headers.get(REQUEST_ID_HEADER))
+        # Routes that want it (to pass along to the next hop) read it here.
+        request.state.request_id = rid
 
         try:
             response = await call_next(request)
             duration_ms = int((time.perf_counter() - start) * 1000)
             status = response.status_code
+            response.headers[REQUEST_ID_HEADER] = rid
 
-            line = f"{client} {method} {path} -> {status} ({duration_ms}ms)"
+            line = f"{client} {method} {path} -> {status} ({duration_ms}ms) [rid={rid}]"
             if status >= 500:
                 self._log.error(line)
             elif status >= 400:
@@ -206,7 +249,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             duration_ms = int((time.perf_counter() - start) * 1000)
             tb = traceback.format_exc()
             self._log.error(
-                f"{client} {method} {path} -> 500 EXCEPTION ({duration_ms}ms)\n"
+                f"{client} {method} {path} -> 500 EXCEPTION ({duration_ms}ms) [rid={rid}]\n"
                 f"  {type(e).__name__}: {e}\n{tb}"
             )
             raise

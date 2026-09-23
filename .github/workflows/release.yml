@@ -18,9 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-        # Sinew v0.1.0 ships ONE test surface: the core (credentials /
-        # config / version). [keyring] is optional and the not-installed path
-        # is covered by the suite itself, so [dev] is the only leg needed.
+        # Sinew ships ONE test surface: the request-logging middleware, run
+        # against a real Starlette app. There are no optional extras to
+        # matrix over, so [dev] is the only leg needed.
         extras: ["dev"]
 
     steps:
