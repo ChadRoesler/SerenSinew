@@ -62,4 +62,4 @@ pip install seren-sinew
 Light by design - depends only on `starlette` (already in every leaf via
 FastAPI), so it stays FastAPI-agnostic and adds nothing to a real install.
 
-GPL-3.0-or-later.
+AGPL-3.0-or-later.

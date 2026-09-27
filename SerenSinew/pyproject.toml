@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 name = "seren-sinew"
 description = "The connective tissue of the Seren stack: shared runtime plumbing (request logging now; cluster client / discovery / DTOs later)."
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.10"
 dynamic = ["version"]
 keywords = ["seren", "fastapi", "starlette", "logging", "middleware"]
@@ -25,7 +25,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: System :: Logging",
-  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
 ]
 
 # Light, like Meninges: starlette only. It's already in every leaf via
