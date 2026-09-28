@@ -2,8 +2,10 @@
 
 Sibling to seren_meninges (the UI / auth / config baseplate). Where Meninges
 is the membrane, Sinew is the tendon: cross-cutting *runtime* concerns shared
-by every Seren web service. First brick: request logging. Future home for the
-cluster client / discovery / DTOs once Lodestar ports from C# to Python.
+by every Seren web service. Request logging; `runas` (seren_sinew.runas),
+starting a command AS a person from a root / LocalSystem service - the ripple
+that wakes the model. Future home for the cluster client / discovery / DTOs
+Lodestar and the Observatory still spell separately (punch-list sinew-cluster).
 """
 from __future__ import annotations
 
