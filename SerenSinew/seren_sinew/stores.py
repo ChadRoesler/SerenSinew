@@ -62,10 +62,12 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import shutil
 import sqlite3
+import tarfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -301,6 +303,23 @@ class StoreKeeper:
         row = next((s for s in self.list() if s["id"] == final.name), {"id": final.name})
         return {**row, "pruned": removed}
 
+    def snapshot_dir(self, snapshot_id: str) -> Optional[Path]:
+        """The folder of one whole snapshot, by id, or None. The id is a stamp
+        this keeper made (no path parts, no .partial)."""
+        if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id.endswith(".partial"):
+            return None
+        d = self.root / snapshot_id
+        return d if d.is_dir() and (d / "manifest.json").is_file() else None
+
+    def archive(self, snapshot_id: str) -> Optional[bytes]:
+        """One snapshot as a tar.gz, for a puller (Lodestar) to stash
+        elsewhere: the files exactly as they sit, manifest first, with the
+        snapshot's id as the top folder. None when there is no such snapshot."""
+        d = self.snapshot_dir(snapshot_id)
+        if d is None:
+            return None
+        return pack_snapshot(d)
+
     def prune(self, now: Optional[float] = None) -> list[str]:
         """Keep the newest keep_daily, then one per ISO week for keep_weekly
         weeks before those. Leftover .partial folders from a crash go too."""
@@ -327,18 +346,103 @@ class StoreKeeper:
         return removed
 
 
+# ── carrying a snapshot to another box ────────────────────────────────────────
+def pack_snapshot(d: Path) -> bytes:
+    """A snapshot folder as a tar.gz with the folder's name on top."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(d / "manifest.json", arcname=f"{d.name}/manifest.json")
+        for f in sorted(d.rglob("*")):
+            if f.is_file() and f.name != "manifest.json":
+                tar.add(f, arcname=f"{d.name}/{f.relative_to(d).as_posix()}")
+    return buf.getvalue()
+
+
+def unpack_snapshot(data: bytes, dest_root: Path, expect_id: Optional[str] = None) -> Path:
+    """Put an archived snapshot under dest_root/<id>/, verified against its
+    manifest (every file present, every sha256 right) before it is kept: a
+    snapshot that does not verify is not stashed. Written to <id>.partial and
+    renamed, like a snapshot being taken. Returns the folder."""
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        names = tar.getnames()
+        tops = {n.split("/", 1)[0] for n in names}
+        if len(tops) != 1:
+            raise ValueError(f"an archive holds one snapshot, this one holds {sorted(tops)}")
+        sid = tops.pop()
+        if expect_id and sid != expect_id:
+            raise ValueError(f"the archive is snapshot {sid}, not {expect_id}")
+        if sid.endswith(".partial") or "/" in sid or ".." in sid:
+            raise ValueError(f"bad snapshot id in archive: {sid!r}")
+        for m in tar.getmembers():
+            if not m.isfile() or m.name.startswith(("/", "..")) or "/../" in m.name:
+                raise ValueError(f"bad member in archive: {m.name!r}")
+        work = dest_root / f"{sid}.partial"
+        if work.exists():
+            shutil.rmtree(work)
+        work.mkdir(parents=True)
+        for m in tar.getmembers():
+            rel = m.name.split("/", 1)[1] if "/" in m.name else ""
+            if not rel:
+                continue
+            out = work / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            src = tar.extractfile(m)
+            with open(out, "wb") as f:
+                shutil.copyfileobj(src, f)
+    problems = verify_snapshot(work)
+    if problems:
+        shutil.rmtree(work, ignore_errors=True)
+        raise ValueError("the snapshot did not verify: " + "; ".join(problems[:5]))
+    final = dest_root / sid
+    if final.exists():
+        shutil.rmtree(final)
+    os.replace(work, final)
+    return final
+
+
+def verify_snapshot(d: Path) -> list[str]:
+    """Every file the manifest names, present, with the right sha256; and
+    nothing the manifest does not name. Empty list = whole."""
+    try:
+        man = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return [f"manifest.json: {e}"]
+    problems = []
+    named = set()
+    for f in man.get("files") or []:
+        rel = f.get("path") or ""
+        named.add(rel)
+        p = d / rel
+        if not p.is_file():
+            problems.append(f"missing: {rel}")
+        elif _sha256(p) != f.get("sha256"):
+            problems.append(f"changed: {rel}")
+    for p in d.rglob("*"):
+        if p.is_file() and p.name != "manifest.json" and p.relative_to(d).as_posix() not in named:
+            problems.append(f"not in the manifest: {p.relative_to(d).as_posix()}")
+    return problems
+
+
 # ── the same three routes on every service ───────────────────────────────────
-def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]]) -> None:
+def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]],
+                     archive_allowed: Optional[Callable[[], bool]] = None,
+                     archive_refusal: str = "this service does not hand its snapshots over HTTP") -> None:
     """GET /stores, POST /stores/snapshot, GET /stores/snapshots on a
     Starlette / FastAPI app. They sit behind whatever auth middleware the
     service already has. get_keeper returns None while the service has no
     keeper (snapshots switched off): the routes then say so, 404.
 
+    GET /stores/snapshots/{id}/archive hands one snapshot over as a tar.gz,
+    for Lodestar to stash on another box.
+
+    archive_allowed, when given, is asked on every archive request; False is
+    a 403 carrying archive_refusal.
+
     There is no restore route, and no route that deletes a snapshot: see the
     module docstring."""
     import asyncio
 
-    from starlette.responses import JSONResponse
+    from starlette.responses import JSONResponse, Response
 
     def _off() -> JSONResponse:
         return JSONResponse({"ok": False, "error": "this service keeps no snapshots (backup.enabled is off)"},
@@ -373,8 +477,27 @@ def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]]) 
             return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
         return JSONResponse({"ok": True, "snapshot": row})
 
+    async def archive(request):                             # noqa: ANN001
+        k = get_keeper()
+        if not k:
+            return _off()
+        # A service may keep its snapshots to itself: listing them and taking
+        # one say nothing of what is inside, the archive IS what is inside.
+        # (Margin: a diary's HTTP reads are off by default, and a backup pull
+        # is a read of the whole diary.)
+        if archive_allowed is not None and not archive_allowed():
+            return JSONResponse({"ok": False, "error": archive_refusal}, status_code=403)
+        sid = request.path_params.get("snapshot_id", "")
+        data = await asyncio.to_thread(k.archive, sid)
+        if data is None:
+            return JSONResponse({"ok": False, "error": f"no snapshot '{sid}'"}, status_code=404)
+        return Response(content=data, media_type="application/gzip",
+                        headers={"Content-Disposition": f'attachment; filename="{k.service}-{sid}.tar.gz"',
+                                 "X-Seren-Snapshot": sid, "X-Seren-Service": k.service})
+
     app.add_route("/stores", stores, methods=["GET"])
     app.add_route("/stores/snapshots", snapshots, methods=["GET"])
+    app.add_route("/stores/snapshots/{snapshot_id}/archive", archive, methods=["GET"])
     app.add_route("/stores/snapshot", snapshot, methods=["POST"])
 
 
@@ -401,4 +524,5 @@ async def snapshot_loop(get_keeper: Callable[[], Optional[StoreKeeper]], every_h
         await asyncio.sleep(check_seconds)
 
 
-__all__ = ["Store", "StoreKeeper", "SnapshotBusy", "copy_store", "KINDS", "add_store_routes", "snapshot_loop"]
+__all__ = ["Store", "StoreKeeper", "SnapshotBusy", "copy_store", "KINDS", "add_store_routes", "snapshot_loop",
+           "pack_snapshot", "unpack_snapshot", "verify_snapshot"]

@@ -234,3 +234,74 @@ def test_snapshots_kept_inside_the_store_are_not_copied_into_themselves(tmp_path
     second = Path(k.snapshot(now=1_000_100)["path"])
     files = sorted(p.relative_to(second).as_posix() for p in second.rglob("*") if p.is_file())
     assert files == ["manifest.json", "raw/all/voice.json"]
+
+
+def test_a_snapshot_travels_as_an_archive_and_is_verified_on_arrival(tmp_path):
+    """Lodestar's half: pull the archive, verify every sha256, stash it."""
+    import io, tarfile
+    from seren_sinew.stores import unpack_snapshot, verify_snapshot
+    f = tmp_path / "voice.json"
+    f.write_text("the card")
+    k = _keeper(tmp_path, [Store("voice", "file", str(f))], export=lambda: {"n.jsonl": [{"a": 1}]})
+    sid = k.snapshot("nightly")["id"]
+    data = k.archive(sid)
+    assert data[:2] == b"\x1f\x8b" and k.archive("nope") is None and k.archive("../x") is None
+    got = unpack_snapshot(data, tmp_path / "stash")
+    assert got == tmp_path / "stash" / sid and verify_snapshot(got) == []
+    assert (got / "raw" / "voice" / "voice.json").read_text() == "the card"
+    assert json.loads((got / "manifest.json").read_text())["reason"] == "nightly"
+    with pytest.raises(ValueError, match="not zzz"):
+        unpack_snapshot(data, tmp_path / "stash2", expect_id="zzz")
+    # a damaged copy is seen, and a forged archive is not stashed
+    (got / "raw" / "voice" / "voice.json").write_text("tampered")
+    assert verify_snapshot(got) == ["changed: raw/voice/voice.json"]
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as out, tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as src:
+        for m in src.getmembers():
+            fh = src.extractfile(m)
+            payload = fh.read() if fh else b""
+            if m.name.endswith("voice.json"):
+                payload = b"forged"
+            m.size = len(payload)
+            out.addfile(m, io.BytesIO(payload))
+    with pytest.raises(ValueError, match="did not verify"):
+        unpack_snapshot(buf.getvalue(), tmp_path / "stash3")
+    assert not (tmp_path / "stash3" / sid).exists() and not list((tmp_path / "stash3").glob("*.partial"))
+
+
+def test_the_archive_route(tmp_path):
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+    from seren_sinew.stores import add_store_routes, unpack_snapshot
+    f = tmp_path / "a.json"
+    f.write_text("x")
+    k = _keeper(tmp_path, [Store("a", "file", str(f))])
+    app = Starlette()
+    add_store_routes(app, lambda: k)
+    with TestClient(app) as c:
+        sid = c.post("/stores/snapshot").json()["snapshot"]["id"]
+        r = c.get(f"/stores/snapshots/{sid}/archive")
+        assert r.status_code == 200 and r.headers["content-type"] == "application/gzip"
+        assert r.headers["x-seren-snapshot"] == sid and r.headers["x-seren-service"] == "seren-test"
+        assert unpack_snapshot(r.content, tmp_path / "stash", expect_id=sid).name == sid
+        assert c.get("/stores/snapshots/nope/archive").status_code == 404
+
+
+def test_a_service_can_keep_its_archives_to_itself(tmp_path):
+    """Margin's case: snapshots are taken and listed, and not handed over."""
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+    from seren_sinew.stores import add_store_routes
+    f = tmp_path / "notes.db"
+    f.write_text("a diary")
+    k = _keeper(tmp_path, [Store("notes", "file", str(f))])
+    allow = {"v": False}
+    app = Starlette()
+    add_store_routes(app, lambda: k, archive_allowed=lambda: allow["v"], archive_refusal="the diary stays here")
+    with TestClient(app) as c:
+        sid = c.post("/stores/snapshot").json()["snapshot"]["id"]
+        assert c.get("/stores/snapshots").json()["count"] == 1, "listing says nothing of what is inside"
+        r = c.get(f"/stores/snapshots/{sid}/archive")
+        assert r.status_code == 403 and r.json()["error"] == "the diary stays here"
+        allow["v"] = True
+        assert c.get(f"/stores/snapshots/{sid}/archive").status_code == 200
