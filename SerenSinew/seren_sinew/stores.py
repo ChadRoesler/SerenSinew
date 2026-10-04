@@ -52,6 +52,18 @@ RETENTION
     stores are megabytes, and a chain of incrementals is one more thing to
     restore wrongly.
 
+THE REHEARSAL (Design note: "backups are useless if you can't validate
+them")
+    POST /stores/snapshots/{id}/rehearse   one of the service's own snapshots
+    POST /stores/rehearse                  a snapshot sent as a tar.gz body
+                                           (Lodestar, from its stash, through
+                                           the Observatory)
+    A restore's dry run: the snapshot is verified, laid out in a scratch
+    folder as the store would sit, every SQLite file is integrity-checked,
+    and the service opens the COPY the way it opens its store, counts it
+    against the manifest and replays its tombstones on it. Then the scratch
+    is removed. The live store is never written to. See rehearse_restore.
+
 NOT HERE, ON PURPOSE: restore. Putting a snapshot back erases everything
 since and brings back anything purged since, so it is not a route anyone can
 call; it will replay the tombstones and be asked for with a reason, like the
@@ -201,7 +213,12 @@ class StoreKeeper:
     keep_daily: int = 14
     keep_weekly: int = 8
     log: Callable[[str], None] = lambda m: None
+    # optional: (restored {store name: folder}, manifest, snapshot folder) ->
+    # dict - the service's own look at a restored COPY during a rehearsal
+    # (rehearse_restore, step 4)
+    check: Optional[Callable[[dict[str, Path], dict[str, Any], Path], dict[str, Any]]] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _rehearsing: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # ── what is kept ──────────────────────────────────────────────────────
     @property
@@ -210,7 +227,15 @@ class StoreKeeper:
 
     def describe(self) -> dict[str, Any]:
         snaps = self.list()
-        return {"service": self.service, "stores": [s.describe() for s in self.stores()],
+        stores = []
+        dest = Path(self.dest).resolve()
+        for s in self.stores():
+            d = s.describe()
+            # snapshots kept inside the store they copy are not part of it
+            if d["exists"] and Path(s.path).is_dir() and Path(s.path).resolve() in dest.parents and dest.is_dir():
+                d["bytes"] = max(0, d["bytes"] - _size(dest))
+            stores.append(d)
+        return {"service": self.service, "stores": stores,
                 "snapshots": {"dir": str(self.root), "count": len(snaps),
                               "latest": snaps[0] if snaps else None,
                               "keep_daily": self.keep_daily, "keep_weekly": self.keep_weekly}}
@@ -320,6 +345,64 @@ class StoreKeeper:
             return None
         return pack_snapshot(d)
 
+    # ── the rehearsal ─────────────────────────────────────────────────────
+    @property
+    def _scratch_root(self) -> Path:
+        return self.root / ".rehearsal"                    # no manifest in it: list() and prune() pass it by
+
+    def rehearse(self, snapshot_id: Optional[str] = None, keep: bool = False) -> Optional[dict[str, Any]]:
+        """Rehearse restoring one of this keeper's snapshots (the newest when
+        no id is given). None when there is no such snapshot."""
+        if not snapshot_id:
+            rows = self.list()
+            snapshot_id = rows[0]["id"] if rows else ""
+        d = self.snapshot_dir(snapshot_id or "")
+        if d is None:
+            return None
+        return self._rehearse(d, "own", keep)
+
+    def rehearse_archive(self, data: bytes, keep: bool = False) -> dict[str, Any]:
+        """Rehearse restoring a snapshot that arrived as a tar.gz (from a
+        stash on another box). It is unpacked into scratch, never into the
+        snapshots folder, and removed afterwards."""
+        incoming = self._scratch_root / f"incoming-{os.getpid()}-{time.time_ns()}"
+        try:
+            try:
+                d = unpack_snapshot(data, incoming)
+            except (ValueError, tarfile.TarError, OSError, EOFError) as e:
+                return {"ok": False, "dry_run": True, "snapshot": None, "service": self.service, "verified": False,
+                        "source": "sent", "problems": [f"the archive could not be unpacked: {e}"],
+                        "live_store_touched": False}
+            man_service = None
+            try:
+                man_service = json.loads((d / "manifest.json").read_text(encoding="utf-8")).get("service")
+            except (OSError, ValueError):
+                pass
+            if man_service != self.service:
+                return {"ok": False, "dry_run": True, "snapshot": d.name, "service": man_service, "verified": True,
+                        "source": "sent", "live_store_touched": False,
+                        "problems": [f"this is a snapshot of {man_service}, and this service is {self.service}"]}
+            return self._rehearse(d, "sent", keep)
+        finally:
+            _remove_tree(incoming)
+
+    def _rehearse(self, d: Path, source: str, keep: bool) -> dict[str, Any]:
+        if not self._rehearsing.acquire(blocking=False):
+            raise RehearsalBusy(f"a rehearsal of {self.service} is already running")
+        try:
+            root = self._scratch_root
+            if root.is_dir():                              # what an earlier one could not remove
+                for old in root.iterdir():
+                    if old.is_dir() and old.name.startswith("run-"):
+                        _remove_tree(old)
+            scratch = root / f"run-{d.name}-{time.time_ns()}"
+            rep = rehearse_restore(d, scratch, self.check, keep)
+            rep["source"] = source
+            self.log(f"rehearsal of {d.name} ({source}): " + ("ok" if rep["ok"] else "FAILED: " + "; ".join(rep["problems"][:3])))
+            return rep
+        finally:
+            self._rehearsing.release()
+
     def prune(self, now: Optional[float] = None) -> list[str]:
         """Keep the newest keep_daily, then one per ISO week for keep_weekly
         weeks before those. Leftover .partial folders from a crash go too."""
@@ -423,7 +506,124 @@ def verify_snapshot(d: Path) -> list[str]:
     return problems
 
 
-# ── the same three routes on every service ───────────────────────────────────
+# ── the rehearsal: a restore's dry run ────────────────────────────────────────
+class RehearsalBusy(RuntimeError):
+    """One rehearsal at a time per service."""
+
+
+def _is_sqlite(p: Path) -> bool:
+    try:
+        with open(p, "rb") as f:
+            return f.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def _remove_tree(d: Path) -> bool:
+    """Remove a scratch folder; True when it is gone. A handle a library has
+    not let go of yet (Windows) gets a few tries."""
+    import gc
+    for _ in range(4):
+        shutil.rmtree(d, ignore_errors=True)
+        if not d.exists():
+            return True
+        gc.collect()
+        time.sleep(0.4)
+    return not d.exists()
+
+
+def rehearse_restore(snapshot: Path, scratch: Path,
+                     check: Optional[Callable[[dict[str, Path], dict[str, Any], Path], dict[str, Any]]] = None,
+                     keep: bool = False) -> dict[str, Any]:
+    """Prove a snapshot can be put back, without putting it back.
+
+        1. verify      every file the manifest names, present, sha256 right
+        2. lay out     raw/<store>/ copied to <scratch>/<store>/ - the store
+                       as it would sit after a restore
+        3. open        every SQLite file in the copy: integrity_check
+        4. check       the service's own check(restored, manifest, snapshot):
+                       open the copy the way the service opens its store,
+                       count what is in it, replay its tombstones ON THE
+                       COPY. Returns a dict; "counts" in it is compared with
+                       the counts the manifest recorded, "problems" (a list)
+                       fails the rehearsal.
+        5. clean up    the scratch copy is removed (keep=True leaves it)
+
+    `scratch` must not exist or must be empty: a rehearsal writes nowhere
+    else, and the live store is never opened for writing by anything here.
+    Never raises for a bad snapshot: the report says what failed."""
+    t0 = time.time()
+    snapshot, scratch = Path(snapshot), Path(scratch)
+    rep: dict[str, Any] = {"ok": False, "dry_run": True, "snapshot": snapshot.name, "service": None,
+                           "created_at": None, "verified": False, "stores": [], "sqlite": [], "check": None,
+                           "problems": [], "live_store_touched": False}
+    problems: list[str] = rep["problems"]
+    if scratch.exists() and any(scratch.iterdir()):
+        problems.append(f"the scratch folder is not empty: {scratch}")
+        rep["seconds"] = round(time.time() - t0, 2)
+        return rep
+    bad = verify_snapshot(snapshot)
+    if bad:
+        problems.extend(bad[:20])
+        rep["seconds"] = round(time.time() - t0, 2)
+        return rep
+    rep["verified"] = True
+    man = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    rep["service"], rep["created_at"] = man.get("service"), man.get("created_at")
+    rep["version"], rep["embedder"] = man.get("version"), man.get("embedder")
+    try:
+        restored: dict[str, Path] = {}
+        for name in man.get("stores") or []:
+            src = snapshot / "raw" / str(name)
+            if not src.is_dir():
+                problems.append(f"the manifest names store '{name}' and raw/{name} is not in the snapshot")
+                continue
+            dst = scratch / str(name)
+            shutil.copytree(src, dst)
+            files = [f for f in dst.rglob("*") if f.is_file()]
+            restored[str(name)] = dst
+            rep["stores"].append({"name": name, "files": len(files), "bytes": sum(f.stat().st_size for f in files)})
+            for f in files:
+                if not _is_sqlite(f):
+                    continue
+                try:
+                    con = sqlite3.connect(f"file:{f.as_posix()}?mode=ro", uri=True)
+                    try:
+                        verdict = str(con.execute("PRAGMA integrity_check").fetchone()[0])
+                    finally:
+                        con.close()
+                except sqlite3.Error as e:
+                    verdict = f"{type(e).__name__}: {e}"
+                rep["sqlite"].append({"file": f.relative_to(scratch).as_posix(), "integrity": verdict})
+                if verdict != "ok":
+                    problems.append(f"{f.relative_to(scratch).as_posix()}: {verdict}")
+        if not restored and not problems:
+            problems.append("the snapshot holds no stores")
+        if check is not None and restored and not problems:
+            try:
+                got = check(restored, man, snapshot) or {}
+            except Exception as e:                          # noqa: BLE001 - a copy that will not open is the finding
+                got = {"problems": [f"the service could not open the restored copy: {type(e).__name__}: {e}"]}
+            problems.extend(str(p) for p in got.pop("problems", None) or [])
+            want, have = man.get("counts"), got.get("counts")
+            if isinstance(want, dict) and isinstance(have, dict):
+                for k in sorted(set(want) & set(have)):
+                    if want[k] != have[k]:
+                        problems.append(f"count '{k}': the manifest says {want[k]}, the restored copy holds {have[k]}")
+            rep["check"] = got
+    except Exception as e:                                  # noqa: BLE001
+        problems.append(f"{type(e).__name__}: {e}")
+    finally:
+        if keep:
+            rep["scratch"] = str(scratch)
+        elif not _remove_tree(scratch):
+            rep["scratch_left_behind"] = str(scratch)        # swept at the next rehearsal
+    rep["ok"] = not problems
+    rep["seconds"] = round(time.time() - t0, 2)
+    return rep
+
+
+# ── the same routes on every service ─────────────────────────────────────────
 def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]],
                      archive_allowed: Optional[Callable[[], bool]] = None,
                      archive_refusal: str = "this service does not hand its snapshots over HTTP") -> None:
@@ -437,6 +637,10 @@ def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]],
 
     archive_allowed, when given, is asked on every archive request; False is
     a 403 carrying archive_refusal.
+
+    POST /stores/snapshots/{id}/rehearse and POST /stores/rehearse (a tar.gz
+    body) run a restore's dry run and answer with its report: 200 when the
+    rehearsal ran, with "ok" saying whether the snapshot passed.
 
     There is no restore route, and no route that deletes a snapshot: see the
     module docstring."""
@@ -495,6 +699,34 @@ def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]],
                         headers={"Content-Disposition": f'attachment; filename="{k.service}-{sid}.tar.gz"',
                                  "X-Seren-Snapshot": sid, "X-Seren-Service": k.service})
 
+    async def rehearse(request):                            # noqa: ANN001
+        k = get_keeper()
+        if not k:
+            return _off()
+        sid = request.path_params.get("snapshot_id", "")
+        try:
+            rep = await asyncio.to_thread(k.rehearse, sid)
+        except RehearsalBusy as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=409)
+        if rep is None:
+            return JSONResponse({"ok": False, "error": f"no snapshot '{sid}'"}, status_code=404)
+        return JSONResponse(rep)
+
+    async def rehearse_sent(request):                       # noqa: ANN001
+        k = get_keeper()
+        if not k:
+            return _off()
+        data = await request.body()
+        if not data:
+            return JSONResponse({"ok": False, "error": "send the snapshot's tar.gz as the body"}, status_code=400)
+        try:
+            rep = await asyncio.to_thread(k.rehearse_archive, data)
+        except RehearsalBusy as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=409)
+        return JSONResponse(rep)
+
+    app.add_route("/stores/snapshots/{snapshot_id}/rehearse", rehearse, methods=["POST"])
+    app.add_route("/stores/rehearse", rehearse_sent, methods=["POST"])
     app.add_route("/stores", stores, methods=["GET"])
     app.add_route("/stores/snapshots", snapshots, methods=["GET"])
     app.add_route("/stores/snapshots/{snapshot_id}/archive", archive, methods=["GET"])
@@ -525,4 +757,4 @@ async def snapshot_loop(get_keeper: Callable[[], Optional[StoreKeeper]], every_h
 
 
 __all__ = ["Store", "StoreKeeper", "SnapshotBusy", "copy_store", "KINDS", "add_store_routes", "snapshot_loop",
-           "pack_snapshot", "unpack_snapshot", "verify_snapshot"]
+           "pack_snapshot", "unpack_snapshot", "verify_snapshot", "rehearse_restore", "RehearsalBusy"]

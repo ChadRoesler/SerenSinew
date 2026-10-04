@@ -305,3 +305,123 @@ def test_a_service_can_keep_its_archives_to_itself(tmp_path):
         assert r.status_code == 403 and r.json()["error"] == "the diary stays here"
         allow["v"] = True
         assert c.get(f"/stores/snapshots/{sid}/archive").status_code == 200
+
+
+# ── the rehearsal: a restore's dry run ────────────────────────────────────────
+def _counting_keeper(tmp_path, live_rows=3, tombstoned=("row 1",)):
+    """A keeper over one live SQLite database whose check counts the restored
+    copy and replays 'tombstones' on it."""
+    db = tmp_path / "live" / "it.db"
+    con = _db(db, live_rows)
+
+    def check(restored, manifest, snap):
+        f = restored["it"] / "it.db"
+        c = sqlite3.connect(f)
+        try:
+            before = c.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+            for v in tombstoned:
+                c.execute("DELETE FROM t WHERE v = ?", (v,))
+            c.commit()
+            after = c.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        finally:
+            c.close()
+        return {"counts": {"rows": before}, "tombstones_replayed": before - after, "after_replay": {"rows": after}}
+
+    def extra():                                                  # its own connection: a route runs this off-thread
+        c = sqlite3.connect(db)
+        try:
+            return {"counts": {"rows": c.execute("SELECT COUNT(*) FROM t").fetchone()[0]}}
+        finally:
+            c.close()
+
+    k = _keeper(tmp_path, [Store("it", "sqlite", str(db))], check=check, extra=extra)
+    return k, con, db
+
+
+def test_a_rehearsal_restores_into_scratch_counts_replays_and_leaves_no_trace(tmp_path):
+    from seren_sinew.stores import _sha256
+    k, con, db = _counting_keeper(tmp_path)
+    sid = k.snapshot()["id"]
+    con.execute("INSERT INTO t VALUES ('written after the snapshot')")
+    con.commit()
+    live_before = con.execute("SELECT v FROM t ORDER BY rowid").fetchall()
+    rep = k.rehearse()                                           # the newest, by default
+    assert rep["ok"] and rep["dry_run"] and rep["verified"] and rep["snapshot"] == sid and rep["source"] == "own"
+    assert rep["sqlite"] == [{"file": "it/it.db", "integrity": "ok"}]
+    assert rep["check"]["counts"] == {"rows": 3} and rep["check"]["tombstones_replayed"] == 1
+    assert rep["check"]["after_replay"] == {"rows": 2}, "the tombstone was replayed on the copy"
+    assert rep["live_store_touched"] is False
+    assert con.execute("SELECT v FROM t ORDER BY rowid").fetchall() == live_before, "the live store is as it was"
+    assert not list((k.root / ".rehearsal").iterdir()), "the scratch copy is gone"
+    assert [s["id"] for s in k.list()] == [sid], "and the scratch folder is not a snapshot"
+    assert k.rehearse("nope") is None
+    con.close()
+
+
+def test_a_rehearsal_fails_out_loud(tmp_path):
+    k, con, db = _counting_keeper(tmp_path)
+    sid = k.snapshot()["id"]
+    snap = k.snapshot_dir(sid)
+    # the manifest's count and the copy disagree
+    man = json.loads((snap / "manifest.json").read_text())
+    man["counts"] = {"rows": 99}
+    (snap / "manifest.json").write_text(json.dumps(man))
+    rep = k.rehearse(sid)
+    assert rep["ok"] is False and rep["problems"] == ["count 'rows': the manifest says 99, the restored copy holds 3"]
+    # a file changed since it was taken: it does not get as far as a copy
+    (snap / "raw" / "it" / "it.db").write_bytes(b"not a database")
+    rep = k.rehearse(sid)
+    assert rep["ok"] is False and rep["verified"] is False and rep["problems"] == ["changed: raw/it/it.db"]
+    assert rep["stores"] == []
+    # a check that cannot open the copy is a finding, not a crash
+    k2, con2, _ = _counting_keeper(tmp_path / "two")
+    k2.check = lambda restored, man, snap: (_ for _ in ()).throw(RuntimeError("will not open"))
+    k2.snapshot()
+    rep = k2.rehearse()
+    assert rep["ok"] is False and "could not open the restored copy: RuntimeError: will not open" in rep["problems"][0]
+    con.close(); con2.close()
+
+
+def test_a_sent_archive_is_rehearsed_and_never_becomes_a_snapshot(tmp_path):
+    from seren_sinew.stores import pack_snapshot
+    k, con, db = _counting_keeper(tmp_path)
+    sid = k.snapshot()["id"]
+    data = pack_snapshot(k.snapshot_dir(sid))
+    # the box that lost its disk: same service, nothing on it
+    (tmp_path / "new").mkdir()
+    fresh = _keeper(tmp_path / "new", [Store("it", "sqlite", str(tmp_path / "new" / "live" / "it.db"))], check=k.check)
+    rep = fresh.rehearse_archive(data)
+    assert rep["ok"] and rep["source"] == "sent" and rep["snapshot"] == sid and rep["check"]["counts"] == {"rows": 3}
+    assert fresh.list() == [] and not (tmp_path / "new" / "live").exists(), "nothing was restored, nothing was kept"
+    assert rep_bad(fresh, b"not a tarball") and rep_bad(fresh, data[: len(data) // 2])
+    other = StoreKeeper("someone-else", lambda: [], tmp_path / "other")
+    rep = other.rehearse_archive(data)
+    assert rep["ok"] is False and "this is a snapshot of seren-test" in rep["problems"][0]
+    con.close()
+
+
+def rep_bad(k, data):
+    rep = k.rehearse_archive(data)
+    return rep["ok"] is False and "could not be unpacked" in rep["problems"][0]
+
+
+def test_the_rehearsal_routes(tmp_path):
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+    from seren_sinew.stores import add_store_routes, pack_snapshot
+    k, con, db = _counting_keeper(tmp_path)
+    app = Starlette()
+    add_store_routes(app, lambda: k)
+    with TestClient(app) as c:
+        sid = c.post("/stores/snapshot").json()["snapshot"]["id"]
+        r = c.post(f"/stores/snapshots/{sid}/rehearse")
+        assert r.status_code == 200 and r.json()["ok"] and r.json()["check"]["counts"] == {"rows": 3}
+        assert c.post("/stores/snapshots/nope/rehearse").status_code == 404
+        r = c.post("/stores/rehearse", content=pack_snapshot(k.snapshot_dir(sid)))
+        assert r.status_code == 200 and r.json()["ok"] and r.json()["source"] == "sent"
+        assert c.post("/stores/rehearse").status_code == 400
+        r = c.post("/stores/rehearse", content=b"junk")
+        assert r.status_code == 200 and r.json()["ok"] is False
+        for path in ("/stores/restore", f"/stores/snapshots/{sid}/restore"):
+            assert c.post(path).status_code in (404, 405), "a rehearsal is not a restore, and there is still no restore"
+    con.close()
