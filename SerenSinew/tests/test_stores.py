@@ -425,3 +425,101 @@ def test_the_rehearsal_routes(tmp_path):
         for path in ("/stores/restore", f"/stores/snapshots/{sid}/restore"):
             assert c.post(path).status_code in (404, 405), "a rehearsal is not a restore, and there is still no restore"
     con.close()
+
+
+# ── the restore: at startup, into an empty store, with a reason ───────────────
+def _old_box(tmp_path):
+    """A service with a database and a folder, snapshotted twice, with a
+    purge recorded between the two."""
+    from seren_sinew.stores import restore_at_startup  # noqa: F401
+    db = tmp_path / "old" / "it.db"
+    con = _db(db, 3)
+    con.close()
+    d = tmp_path / "old" / "state"
+    (d / "sub").mkdir(parents=True)
+    (d / "sub" / "a.json").write_text("a")
+    (d / "noise.log").write_text("noise")
+    tombs: list = []
+    k = StoreKeeper("seren-test", lambda: [Store("it", "sqlite", str(db)), Store("state", "dir", str(d), exclude=("*.log",))],
+                    tmp_path / "old-backups", export=lambda: {"tombstones.jsonl": list(tombs)})
+    first = k.snapshot(now=time.time() - 3600)["id"]
+    tombs.append({"id": "leak-1", "reason": "a secret"})
+    second = k.snapshot()["id"]
+    return k, first, second
+
+
+def _new_box(tmp_path):
+    new = tmp_path / "new"
+    stores = [Store("it", "sqlite", str(new / "store" / "renamed.db")),
+              Store("state", "dir", str(new / "state"), exclude=("*.log",))]
+    return stores, new / "backups" / "seren-test"
+
+
+def test_a_restore_goes_into_an_empty_store_with_a_reason_and_leaves_a_receipt(tmp_path):
+    from seren_sinew.stores import pending_tombstones, restore_at_startup, restore_receipts, clear_pending_tombstones
+    k, first, second = _old_box(tmp_path)
+    stores, receipts = _new_box(tmp_path)
+    (tmp_path / "new" / "state").mkdir(parents=True)
+    (tmp_path / "new" / "state" / "model.log").write_text("a log is not a store")
+    said = []
+    assert restore_at_startup("seren-test", stores, "", "x", receipts) is None, "nothing asked"
+    rep = restore_at_startup("seren-test", stores, str(k.snapshot_dir(first)), "the old box died", receipts, log=said.append)
+    assert rep["restored"] and rep["snapshot"] == first and rep["files"] == 2 and rep["reason"] == "the old box died"
+    con = sqlite3.connect(tmp_path / "new" / "store" / "renamed.db")
+    assert con.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 3, "under the name this install uses"
+    con.close()
+    assert (tmp_path / "new" / "state" / "sub" / "a.json").read_text() == "a"
+    # what was purged AFTER this snapshot is known from the snapshot beside it
+    assert [t["id"] for t in pending_tombstones(receipts)] == ["leak-1"] and rep["tombstones_to_replay"] == 1
+    clear_pending_tombstones(receipts)
+    assert pending_tombstones(receipts) == []
+    assert [r["snapshot"] for r in restore_receipts(receipts)] == [first] and "RESTORED" in said[-1]
+    # the key left in the config: the next start passes it by, and says why
+    again = restore_at_startup("seren-test", stores, str(k.snapshot_dir(first)), "the old box died", receipts, log=said.append)
+    assert again["restored"] is False and "already restored" in again["why"] and len(restore_receipts(receipts)) == 1
+
+
+def test_a_store_that_holds_something_is_never_overwritten(tmp_path):
+    from seren_sinew.stores import restore_at_startup
+    k, first, second = _old_box(tmp_path)
+    stores, receipts = _new_box(tmp_path)
+    con = _db(tmp_path / "new" / "store" / "renamed.db", 1)
+    con.close()
+    rep = restore_at_startup("seren-test", stores, str(k.snapshot_dir(second)), "a rollback", receipts)
+    assert rep == {"restored": False, "why": "this service already has a store, and a restore only goes into an empty one",
+                   "not_empty": ["it"]}
+    con = sqlite3.connect(tmp_path / "new" / "store" / "renamed.db")
+    assert con.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1, "as it was"
+    con.close()
+    assert not (tmp_path / "new" / "state").exists(), "and nothing was half restored beside it"
+
+
+def test_a_restore_that_cannot_be_done_as_asked_stops_the_service(tmp_path):
+    from seren_sinew.stores import RestoreRefused, pack_snapshot, restore_at_startup
+    k, first, second = _old_box(tmp_path)
+    stores, receipts = _new_box(tmp_path)
+    snap = str(k.snapshot_dir(second))
+    for kw, says in (
+            (dict(source=snap, reason=""), "asked for with a reason"),
+            (dict(source=str(tmp_path / "nowhere"), reason="x"), "no snapshot at"),
+            (dict(service="seren-other", source=snap, reason="x"), "is a snapshot of seren-test"),
+            (dict(source=snap, reason="x", stores=stores + [Store("voice", "file", str(tmp_path / "new" / "v.json"))]),
+             "does not hold voice")):
+        with pytest.raises(RestoreRefused, match=says):
+            restore_at_startup(kw.get("service", "seren-test"), kw.get("stores", stores), kw["source"], kw["reason"], receipts)
+    assert not (tmp_path / "new" / "store").exists(), "refused before anything was copied"
+    # an archive works as a source; a damaged one is refused
+    tar = tmp_path / "snap.tar.gz"
+    tar.write_bytes(pack_snapshot(k.snapshot_dir(second)))
+    bad = tmp_path / "bad.tar.gz"
+    bad.write_bytes(tar.read_bytes()[:200])
+    with pytest.raises(RestoreRefused, match="could not be unpacked"):
+        restore_at_startup("seren-test", stores, str(bad), "x", receipts)
+    rep = restore_at_startup("seren-test", stores, str(tar), "from the archive", receipts)
+    assert rep["restored"] and rep["snapshot"] == second and not (receipts / ".restore-incoming").exists()
+    # a snapshot that rotted on the shelf
+    stores2, receipts2 = [Store("it", "sqlite", str(tmp_path / "third" / "it.db")),
+                          Store("state", "dir", str(tmp_path / "third" / "state"))], tmp_path / "third" / "b"
+    (k.snapshot_dir(first) / "raw" / "state" / "sub" / "a.json").write_text("rot")
+    with pytest.raises(RestoreRefused, match="does not verify"):
+        restore_at_startup("seren-test", stores2, str(k.snapshot_dir(first)), "x", receipts2)

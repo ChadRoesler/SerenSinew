@@ -64,11 +64,13 @@ them")
     against the manifest and replays its tombstones on it. Then the scratch
     is removed. The live store is never written to. See rehearse_restore.
 
-NOT HERE, ON PURPOSE: restore. Putting a snapshot back erases everything
-since and brings back anything purged since, so it is not a route anyone can
-call; it will replay the tombstones and be asked for with a reason, like the
-other ways of changing what a memory says. Until it is built, a snapshot is
-restored by a person, with the service stopped.
+THE RESTORE (restore_at_startup). Putting a snapshot back erases everything
+since and brings back anything purged since, so it is NOT a route and not a
+tool: a service does it at startup, from two keys in its own config
+(backup.restore_from, backup.restore_reason), only into an EMPTY store, and
+it replays the tombstones. A fresh box is restored that way; a store that
+already holds something is never overwritten. There is still no route that
+restores a snapshot and none that deletes one.
 """
 from __future__ import annotations
 
@@ -623,6 +625,197 @@ def rehearse_restore(snapshot: Path, scratch: Path,
     return rep
 
 
+# ── the restore: at startup, into an empty store, with a reason ───────────────
+class RestoreRefused(RuntimeError):
+    """A restore was asked for and cannot be done as asked. The service does
+    not start: coming up empty when a restore was meant is the quiet failure."""
+
+
+def _store_is_empty(store: Store, skip: Optional[Path] = None) -> bool:
+    """Nothing there to overwrite. A file or database: no file (or an empty
+    one). A directory: no files besides what the store excludes and the
+    snapshots folder (`skip`)."""
+    p = Path(store.path)
+    if not p.exists():
+        return True
+    if p.is_file():
+        return p.stat().st_size == 0
+    skip = skip.resolve() if skip is not None else None
+    for f in p.rglob("*"):
+        if not f.is_file():
+            continue
+        if skip is not None and (skip == f.resolve() or skip in f.resolve().parents):
+            continue
+        if _excluded(f.relative_to(p), store.exclude):
+            continue
+        return False
+    return True
+
+
+def _read_jsonl(p: Path) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    out.append(row)
+    except OSError:
+        pass
+    return out
+
+
+def _tombstones_beside(snapshot: Path) -> list[dict[str, Any]]:
+    """Every tombstone known to this snapshot and to the snapshots beside it
+    (a stash keeps a service's snapshots side by side, and a later one's
+    export carries the purges made since this one). By id, newest word wins."""
+    seen: dict[str, dict[str, Any]] = {}
+    folders = [d for d in sorted(snapshot.parent.iterdir()) if d.is_dir() and (d / "manifest.json").is_file()] \
+        if snapshot.parent.is_dir() else [snapshot]
+    for d in folders:
+        for row in _read_jsonl(d / "export" / "tombstones.jsonl"):
+            if row.get("id"):
+                seen[str(row["id"])] = row
+    return list(seen.values())
+
+
+def restore_receipts(receipts_dir: Path) -> list[dict[str, Any]]:
+    """Every restore this service has done, oldest first."""
+    return _read_jsonl(Path(receipts_dir) / "restores.jsonl")
+
+
+def pending_tombstones(receipts_dir: Path) -> list[dict[str, Any]]:
+    """Tombstones a restore left for the service to replay once its store is
+    open. Still there after a crash between the copy and the replay."""
+    p = Path(receipts_dir) / "restore-pending.json"
+    try:
+        got = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [t for t in (got.get("tombstones") or []) if isinstance(t, dict)]
+
+
+def clear_pending_tombstones(receipts_dir: Path) -> None:
+    try:
+        (Path(receipts_dir) / "restore-pending.json").unlink()
+    except OSError:
+        pass
+
+
+def restore_at_startup(service: str, stores: list[Store], source: str, reason: str, receipts_dir: Path,
+                       log: Callable[[str], None] = lambda m: None,
+                       extra_tombstones: Optional[list[dict[str, Any]]] = None) -> Optional[dict[str, Any]]:
+    """Put a snapshot back. Called by a service BEFORE it opens its store,
+    from two config keys (backup.restore_from, backup.restore_reason), and
+    from nowhere else: there is no route and no tool (decided with the user,
+    3 Oct 2026 - the same reasoning as no delete).
+
+        source   a snapshot folder, or a snapshot's .tar.gz. Blank = nothing
+                 is asked: returns None.
+        reason   required. A restore is asked for with a reason, and the
+                 reason is kept in the receipt.
+
+    ONLY INTO AN EMPTY STORE. When any store this service keeps already holds
+    something, nothing is restored and the service starts on what it has; the
+    answer says so. Rolling a live store back is a person moving it aside
+    first. After a successful restore the key can stay in the config: the
+    store is no longer empty, so the next start passes it by.
+
+    Refused (RestoreRefused, the service does not start): no reason, a source
+    that is not there, a snapshot that does not verify, a snapshot of another
+    service, a store the snapshot does not hold.
+
+    TOMBSTONES. What was purged after the snapshot was taken must not come
+    back. The tombstones this snapshot and its neighbours know (a stash keeps
+    them side by side) plus extra_tombstones are written to
+    <receipts_dir>/restore-pending.json BEFORE anything is copied; the
+    service replays them when its store is open and then clears the file
+    (pending_tombstones, clear_pending_tombstones).
+
+    The receipt goes to <receipts_dir>/restores.jsonl."""
+    source = (source or "").strip()
+    if not source:
+        return None
+    receipts_dir = Path(receipts_dir)
+    wanted = [s for s in stores if s.backed_up]
+    full = [s.name for s in wanted if not _store_is_empty(s, skip=receipts_dir.parent)]
+    if full:
+        done = [r for r in restore_receipts(receipts_dir) if r.get("source") == source]
+        why = (f"already restored from it on {done[-1].get('restored')}" if done
+               else "this service already has a store, and a restore only goes into an empty one")
+        log(f"backup.restore_from is set and nothing was restored: {why} ({', '.join(full)} not empty). "
+            "Remove the key, or move the store aside first if a rollback is what you mean.")
+        return {"restored": False, "why": why, "not_empty": full}
+    if not (reason or "").strip():
+        raise RestoreRefused("backup.restore_from is set and backup.restore_reason is not: "
+                             "a restore is asked for with a reason")
+    src = Path(os.path.expanduser(source))
+    work: Optional[Path] = None
+    try:
+        if src.is_file():
+            work = receipts_dir / ".restore-incoming"
+            _remove_tree(work)
+            try:
+                snap = unpack_snapshot(src.read_bytes(), work)
+            except (ValueError, tarfile.TarError, OSError, EOFError) as e:
+                raise RestoreRefused(f"{src} could not be unpacked as a snapshot: {e}") from e
+        elif (src / "manifest.json").is_file():
+            snap = src
+            bad = verify_snapshot(snap)
+            if bad:
+                raise RestoreRefused(f"the snapshot at {snap} does not verify: " + "; ".join(bad[:5]))
+        else:
+            raise RestoreRefused(f"backup.restore_from: no snapshot at {src} (a snapshot folder, or its .tar.gz)")
+        man = json.loads((snap / "manifest.json").read_text(encoding="utf-8"))
+        if man.get("service") != service:
+            raise RestoreRefused(f"{src} is a snapshot of {man.get('service')}, and this service is {service}")
+        held = [str(n) for n in man.get("stores") or []]
+        missing = [s.name for s in wanted if s.name not in held or not (snap / "raw" / s.name).is_dir()]
+        if missing:
+            raise RestoreRefused(f"the snapshot does not hold {', '.join(missing)} (it holds {', '.join(held) or 'nothing'})")
+
+        tombs = {str(t["id"]): t for t in _tombstones_beside(snap) + list(extra_tombstones or []) if t.get("id")}
+        receipts_dir.mkdir(parents=True, exist_ok=True)
+        if tombs:
+            (receipts_dir / "restore-pending.json").write_text(
+                json.dumps({"snapshot": snap.name, "tombstones": list(tombs.values())}), encoding="utf-8")
+
+        files = 0
+        for s in wanted:
+            raw, dst = snap / "raw" / s.name, Path(s.path)
+            if s.kind in ("sqlite", "file"):
+                inside = [f for f in raw.iterdir() if f.is_file()]
+                if len(inside) != 1:
+                    raise RestoreRefused(f"raw/{s.name} should hold one file and holds {len(inside)}")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(inside[0], dst)                 # under the name this install uses
+                files += 1
+            else:
+                for f in raw.rglob("*"):
+                    if f.is_file():
+                        out = dst / f.relative_to(raw)
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, out)
+                        files += 1
+        receipt = {"service": service, "snapshot": snap.name, "snapshot_created": man.get("created"),
+                   "source": source, "reason": reason.strip(), "restored_at": time.time(),
+                   "restored": datetime.now(timezone.utc).isoformat(), "stores": [s.name for s in wanted],
+                   "files": files, "version": man.get("version"), "embedder": man.get("embedder"),
+                   "counts": man.get("counts"), "tombstones_to_replay": len(tombs)}
+        with open(receipts_dir / "restores.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(receipt, default=str) + "\n")
+        log(f"RESTORED from snapshot {snap.name} ({files} file(s); {len(tombs)} tombstone(s) to replay). "
+            f"Reason: {reason.strip()}")
+        return {"restored": True, **receipt}
+    finally:
+        if work is not None:
+            _remove_tree(work)
+
+
 # ── the same routes on every service ─────────────────────────────────────────
 def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]],
                      archive_allowed: Optional[Callable[[], bool]] = None,
@@ -757,4 +950,6 @@ async def snapshot_loop(get_keeper: Callable[[], Optional[StoreKeeper]], every_h
 
 
 __all__ = ["Store", "StoreKeeper", "SnapshotBusy", "copy_store", "KINDS", "add_store_routes", "snapshot_loop",
-           "pack_snapshot", "unpack_snapshot", "verify_snapshot", "rehearse_restore", "RehearsalBusy"]
+           "pack_snapshot", "unpack_snapshot", "verify_snapshot", "rehearse_restore", "RehearsalBusy",
+           "restore_at_startup", "RestoreRefused", "restore_receipts", "pending_tombstones",
+           "clear_pending_tombstones"]
