@@ -1,7 +1,7 @@
 """
 "I need this service up" / "I am done with it" (seren_sinew.orchestration).
 
-Design note: hippocampus => Lodestar => Observatory => start llama =>
+The chain: hippocampus => Lodestar => Observatory => start llama =>
 Observatory waits until llama is up => tells Lodestar => Lodestar tells the
 hippocampus it is ready. Pinned here, the shared half:
 

@@ -4,7 +4,7 @@ seren_sinew.stores
 
 What a service keeps on disk, said out loud - and snapshots of it.
 
-WHY (Design note:): every Seren service holds something that would be
+WHY: every Seren service holds something that would be
 lost with a dead disk or a bad migration - a vector store, a SQLite file, a
 state file, a voice card - and none of them could say what, or copy it. This
 module is the shared answer:
@@ -52,8 +52,7 @@ RETENTION
     stores are megabytes, and a chain of incrementals is one more thing to
     restore wrongly.
 
-THE REHEARSAL (Design note: "backups are useless if you can't validate
-them")
+THE REHEARSAL (backups are useless if you cannot validate them)
     POST /stores/snapshots/{id}/rehearse   one of the service's own snapshots
     POST /stores/rehearse                  a snapshot sent as a tar.gz body
                                            (Lodestar, from its stash, through
@@ -711,8 +710,8 @@ def restore_at_startup(service: str, stores: list[Store], source: str, reason: s
                        extra_tombstones: Optional[list[dict[str, Any]]] = None) -> Optional[dict[str, Any]]:
     """Put a snapshot back. Called by a service BEFORE it opens its store,
     from two config keys (backup.restore_from, backup.restore_reason), and
-    from nowhere else: there is no route and no tool (decided with the user,
-    3 Oct 2026 - the same reasoning as no delete).
+    from nowhere else: there is no route and no tool (the same reasoning
+    as no delete).
 
         source   a snapshot folder, or a snapshot's .tar.gz. Blank = nothing
                  is asked: returns None.

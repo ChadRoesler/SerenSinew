@@ -5,7 +5,7 @@ seren_sinew.orchestration
 "I need this service up" and "I am done with it", said the same way by
 everyone who says it.
 
-THE CHAIN (Design note:):
+THE CHAIN:
 
     hippocampus ──ensure──▶ Lodestar ──ensure──▶ Observatory ──▶ start llama
                                                       │  waits until llama

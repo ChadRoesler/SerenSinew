@@ -11,7 +11,7 @@ The policy is pure, so every row of it is checked here on any box:
 - root on Linux drops with runuser; anyone else there needs sudo
 - LocalSystem on Windows borrows the person's logged-on session; any other
   Windows account asking for someone else is refused with the reason
-- names compare without the domain and case (".\\the user" is "alice")
+- names compare without the domain and case (".\\Alice" is "alice")
 
 and the mechanics that don't need a privileged process: the runuser / sudo
 command lines, the Windows environment block round trip, finding a program on
@@ -39,7 +39,7 @@ def test_an_ordinary_account_with_no_run_as_runs_as_itself():
     assert plan("", current=("alice", False), windows=False) == Plan("direct", "alice", "alice")
 
 
-@pytest.mark.parametrize("run_as", ["alice", "the user", ".\\alice", "BOX\\alice", "alice@box"])
+@pytest.mark.parametrize("run_as", ["alice", "Alice", ".\\alice", "BOX\\alice", "alice@box"])
 def test_the_same_account_runs_directly_whatever_the_spelling(run_as):
     assert plan(run_as, current=("alice", False), windows=True).mode == "direct"
 
@@ -58,8 +58,8 @@ def test_another_linux_account_needs_sudo():
 
 
 def test_localsystem_borrows_the_logged_on_session():
-    p = plan(".\\the user", current=("SYSTEM", True), windows=True)
-    assert p.mode == "windows-session" and p.user == ".\\the user"
+    p = plan(".\\Alice", current=("SYSTEM", True), windows=True)
+    assert p.mode == "windows-session" and p.user == ".\\Alice"
 
 
 def test_another_windows_account_cannot_switch():

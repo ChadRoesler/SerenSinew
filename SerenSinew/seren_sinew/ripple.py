@@ -6,7 +6,7 @@ Running a ripple: the one runner every service that receives one uses.
 
 A ripple is the hippocampus reaching the main model - at bedtime for a brief,
 when a draft waits for review - named for the sharp-wave ripples a sleeping
-hippocampus fires to reach the cortex (Design note:). Where it is run
+hippocampus fires to reach the cortex. Where it is run
 depends on the setup, and every place runs it the same way, through this:
 
 - the hippocampus itself, when the model is on its box (`ripple.type: script`)

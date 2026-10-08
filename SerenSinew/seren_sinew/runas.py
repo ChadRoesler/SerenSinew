@@ -8,11 +8,11 @@ WHY: a service on a Seren box usually runs as root (a node's systemd unit) or
 LocalSystem (an NSSM service on Windows), and the thing it needs to start
 lives in a person's account - `claude` and its login in their profile, their
 PATH, their home. The hippocampus's ripple wakes the main model this way, and
-the Observatory runs a ripple on the box the model lives on. Design note:
-2026: "a localsystem can call it AS me as needed". One copy of that here, so
+the Observatory runs a ripple on the box the model lives on: a LocalSystem
+service can call it AS the person, as needed. One copy of that here, so
 every service that needs it does it the same way. It lives in Sinew, not
 Meninges: Sinew is the connective RUNTIME code the services share, Meninges
-the membrane (contracts, config, auth) - Design note:.
+the membrane (contracts, config, auth).
 
 How, by platform:
 

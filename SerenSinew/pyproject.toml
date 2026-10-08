@@ -1,6 +1,6 @@
 # ========================================================================
 #  seren-sinew - the Seren shared runtime plumbing
-#  the user owns release.yml / Trusted Publishing / dependabot wiring; this is
+#  Release wiring (release.yml, Trusted Publishing, dependabot) lives apart; this is
 #  just the package shape: deps minimal, starlette-only (already in every
 #  leaf via FastAPI, so it adds nothing to the real install).
 # ========================================================================
