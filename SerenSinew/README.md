@@ -47,6 +47,33 @@ Knobs (per `env_prefix`):
 | `<PREFIX>_LOG_LEVEL` | `INFO` (default) `\| DEBUG \| WARNING \| ERROR` |
 | `<PREFIX>_LOG_QUERY` | `1` to append `?query` to the logged path (off by default - query strings can carry tokens / PII) |
 
+**Running apps as needed** (`seren_sinew.orchestration`, `seren_sinew.ondemand`).
+"I need this up" and "I'm done with it", said the same way by every Seren app:
+`ensure` / `release` messages, and a lease book that knows who holds what, for
+how long (a lease runs out unless it is renewed), and how long an app has sat
+with nobody holding it. A **run policy** per app says which apps run all the
+time and which run as needed:
+
+| mode | |
+| --- | --- |
+| `unmanaged` | the default: a release stops what an ensure started, nothing else |
+| `always` | never stopped |
+| `on_demand` | started by an ensure, stopped after `idle_minutes` with nobody holding it |
+| `scheduled` | kept up inside `hours` (`"22:00-07:00"`), on demand outside them |
+
+`decide()` turns the book, what's running and the policies into "start this,
+stop that"; Lodestar runs it on a timer (its `orchestration:` block). For the
+caller, `OnDemandTransport` wraps an app's own httpx client: a refused
+connection asks Lodestar to start the other app and retries, and the lease is
+renewed while the calls keep coming.
+
+```python
+from seren_sinew.ondemand import OnDemand, OnDemandTransport
+
+probe = OnDemand(lodestar_url, "probe", holder="seren-workbench", token=lodestar_token)
+client = httpx.AsyncClient(base_url=probe_url, transport=OnDemandTransport(probe))
+```
+
 ## What's coming
 
 The cluster client, discovery and the DTOs that Lodestar and Observatory

@@ -55,7 +55,9 @@ def test_the_last_holder_stops_what_an_ensure_started():
 def test_a_service_that_was_already_running_is_never_stopped_by_a_release():
     book = Leases()
     book.acquire("node-b", "kokoro", "a", started=False)        # someone started it by hand
-    assert book.snapshot() == [{"node": "node-b", "service": "kokoro", "holders": ["a"], "started_by_lease": False}]
+    row = book.snapshot()[0]
+    assert {k: row[k] for k in ("node", "service", "holders", "started_by_lease")} == \
+        {"node": "node-b", "service": "kokoro", "holders": ["a"], "started_by_lease": False}
     assert book.release("node-b", "kokoro", "a") == ([], False)
     # but once ANY ensure has started it, the lease owns stopping it
     book.acquire("node-b", "kokoro", "a", started=True)
