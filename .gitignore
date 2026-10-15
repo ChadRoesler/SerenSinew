@@ -376,6 +376,6 @@ _version.py
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-# local venvs (the Makefile creates .venv-base; keep all venvs out of git)
+# local venvs (keep all venvs out of git)
 .venv/
 .venv-*/
