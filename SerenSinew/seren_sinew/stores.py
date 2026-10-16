@@ -45,12 +45,37 @@ HOW EACH KIND IS COPIED
              the safety net if a segment was mid-write.
     dir      copied as it is, minus `exclude` patterns.
     file     copied as it is.
+    blobs    a seren_sinew.blobs folder: files named by their sha256, so one
+             that is in the previous snapshot is HARDLINKED from there, not
+             copied again (the first time it is a real copy - a snapshot that
+             shares an inode with the live file is not a backup). Its sha256
+             is taken from the previous manifest too, so a day's snapshot of
+             a gigabyte of pictures nobody touched reads none of them.
 
 RETENTION
     The newest `keep_daily` snapshots are kept, then one per ISO week for
     `keep_weekly` weeks before those. Every snapshot is a full one: the
     stores are megabytes, and a chain of incrementals is one more thing to
-    restore wrongly.
+    restore wrongly. (A blobs store's files are shared between snapshots by
+    hardlink, which is still every snapshot whole: remove any one and the
+    others stand.)
+
+THE ARCHIVE (one snapshot carried to another box) is a tar, written to a
+    file and streamed, never built in memory. `compress` on the keeper picks
+    gz (the default: quick, fine), xz (LZMA2, about half the size of gz on a
+    database, slow and pointless on pictures and video, which are compressed
+    already) or none. unpack_snapshot reads whichever it is handed.
+
+    INCREMENTAL: a puller that already holds this service's snapshot S asks
+    for the next one with ?since=S. The archive then leaves out every file
+    whose path and sha256 are the same as in S (a blobs store's pictures,
+    which never change), and says so in X-Seren-Since. The manifest always
+    travels whole. On arrival unpack_snapshot(link_from=<the stash's S>)
+    hardlinks each missing file from S, checks every sha256, and keeps the
+    snapshot only when it is whole - so a stash of twenty-two snapshots of a
+    gigabyte of pictures carries one gigabyte over the wire and holds one on
+    disk, like the service's own. A `since` the service no longer has gives
+    a full archive and no header.
 
 THE REHEARSAL (backups are useless if you cannot validate them)
     POST /stores/snapshots/{id}/rehearse   one of the service's own snapshots
@@ -86,10 +111,14 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Union
 
-KINDS = ("sqlite", "chroma", "dir", "file")
+KINDS = ("sqlite", "chroma", "dir", "file", "blobs")
 STAMP = "%Y%m%d-%H%M%S"
+# how an archive is compressed: tarfile mode suffix, media type, file extension
+COMPRESS = {"gz": ("gz", "application/gzip", ".tar.gz"),
+            "xz": ("xz", "application/x-xz", ".tar.xz"),
+            "none": ("", "application/x-tar", ".tar")}
 
 
 @dataclass
@@ -101,6 +130,12 @@ class Store:
     what: str = ""                         # one line for a person: what is in it
     exclude: tuple[str, ...] = ()          # dir / chroma: glob patterns left out (caches, logs)
     backed_up: bool = True                 # False = declared, not copied (a download, a log)
+    # True = a restore from a snapshot that does not hold this store starts it
+    # empty instead of refusing: for a store a service grew after its
+    # snapshots began (keepsakes beside a years-old notes.db). The stores a
+    # service is nothing without stay required, so a snapshot that holds none
+    # of them is still the loud failure, not the quiet one.
+    optional: bool = False
 
     def describe(self) -> dict[str, Any]:
         p = Path(self.path)
@@ -178,8 +213,34 @@ def _copy_tree(src: Path, dst: Path, exclude: tuple[str, ...], sqlite_names: tup
             shutil.copy2(f, out)
 
 
-def copy_store(store: Store, dest: Path, skip: Optional[Path] = None) -> None:
-    """Copy one store into dest (a directory), the way its kind needs."""
+def _copy_blobs(src: Path, dst: Path, link_from: Optional[Path]) -> None:
+    """A blobs folder: every file whose name is a sha256 (the rest - .incoming,
+    strays - is not the store). One the previous snapshot already holds under
+    that name holds those bytes, so it is hardlinked from there; a link that
+    cannot be made (another device, a filesystem without them) is a copy."""
+    from .blobs import is_digest
+    for f in src.rglob("*"):
+        if not f.is_file() or not is_digest(f.name):
+            continue
+        rel = f.relative_to(src)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        out = dst / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        prev = link_from / rel if link_from is not None else None
+        if prev is not None and prev.is_file() and prev.stat().st_size == f.stat().st_size:
+            try:
+                os.link(prev, out)
+                continue
+            except OSError:
+                pass
+        shutil.copy2(f, out)
+
+
+def copy_store(store: Store, dest: Path, skip: Optional[Path] = None, link_from: Optional[Path] = None) -> None:
+    """Copy one store into dest (a directory), the way its kind needs.
+    link_from: the same store's copy in the previous snapshot, for a kind
+    that can share unchanged files with it (blobs)."""
     src = Path(store.path)
     if store.kind == "sqlite":
         _copy_sqlite(src, dest / src.name)
@@ -190,6 +251,8 @@ def copy_store(store: Store, dest: Path, skip: Optional[Path] = None) -> None:
     elif store.kind == "file":
         dest.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest / src.name)
+    elif store.kind == "blobs":
+        _copy_blobs(src, dest, link_from)
     else:
         raise ValueError(f"store '{store.name}': unknown kind '{store.kind}' (one of {', '.join(KINDS)})")
 
@@ -205,6 +268,7 @@ class StoreKeeper:
                  plain export, written beside the raw copy
     extra        optional: () -> dict merged into the manifest (version,
                  embedder, counts)
+    compress     how an archive is compressed: gz | xz | none (COMPRESS)
     """
     service: str
     stores: Callable[[], list[Store]]
@@ -214,12 +278,21 @@ class StoreKeeper:
     keep_daily: int = 14
     keep_weekly: int = 8
     log: Callable[[str], None] = lambda m: None
+    compress: str = "gz"
     # optional: (restored {store name: folder}, manifest, snapshot folder) ->
     # dict - the service's own look at a restored COPY during a rehearsal
     # (rehearse_restore, step 4)
     check: Optional[Callable[[dict[str, Path], dict[str, Any], Path], dict[str, Any]]] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _rehearsing: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # the last rehearsal this process ran: what a viewer's backup panel shows
+    # beside the snapshots (snapshot, ok, source, when, how long, how many
+    # problems - never what a problem said about the data)
+    _last_rehearsal: Optional[dict[str, Any]] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.compress not in COMPRESS:
+            raise ValueError(f"compress: '{self.compress}' is not one of {', '.join(COMPRESS)}")
 
     # ── what is kept ──────────────────────────────────────────────────────
     @property
@@ -236,10 +309,16 @@ class StoreKeeper:
             if d["exists"] and Path(s.path).is_dir() and Path(s.path).resolve() in dest.parents and dest.is_dir():
                 d["bytes"] = max(0, d["bytes"] - _size(dest))
             stores.append(d)
+        # the newest snapshot a Lodestar asked for (its reason says so): when
+        # the stash elsewhere last caught up, as far as this box can tell
+        pulled = next((s for s in snaps if str(s.get("reason") or "").startswith("Lodestar pull")), None)
         return {"service": self.service, "stores": stores,
                 "snapshots": {"dir": str(self.root), "count": len(snaps),
                               "latest": snaps[0] if snaps else None,
-                              "keep_daily": self.keep_daily, "keep_weekly": self.keep_weekly}}
+                              "last_pull": ({"id": pulled["id"], "created_at": pulled["created_at"],
+                                             "reason": pulled["reason"]} if pulled else None),
+                              "keep_daily": self.keep_daily, "keep_weekly": self.keep_weekly},
+                "last_rehearsal": self._last_rehearsal}
 
     # ── snapshots ─────────────────────────────────────────────────────────
     def list(self) -> list[dict[str, Any]]:
@@ -283,6 +362,18 @@ class StoreKeeper:
             n += 1
             final = self.root / f"{stamp}-{n}"
         work = final.with_name(final.name + ".partial")
+        # the previous snapshot: a blobs store shares its unchanged files
+        # with it (hardlink), and their hashes are read off its manifest
+        prev_dir: Optional[Path] = None
+        prev_sha: dict[str, str] = {}
+        rows = self.list()
+        if rows:
+            prev_dir = Path(rows[0]["path"])
+            try:
+                prev_sha = {f["path"]: f["sha256"] for f in
+                           json.loads((prev_dir / "manifest.json").read_text(encoding="utf-8")).get("files") or []}
+            except (OSError, ValueError, KeyError, TypeError):
+                prev_dir, prev_sha = None, {}
         try:
             if work.exists():
                 shutil.rmtree(work)
@@ -295,7 +386,8 @@ class StoreKeeper:
                 if not Path(s.path).exists():
                     skipped.append({"name": s.name, "why": "nothing on disk yet"})
                     continue
-                copy_store(s, work / "raw" / s.name, skip=Path(self.dest))
+                link_from = prev_dir / "raw" / s.name if prev_dir is not None and s.kind == "blobs" else None
+                copy_store(s, work / "raw" / s.name, skip=Path(self.dest), link_from=link_from)
                 copied.append(s.name)
             exports: dict[str, int] = {}
             if self.export is not None:
@@ -308,8 +400,19 @@ class StoreKeeper:
                             f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
                             count += 1
                     exports[fname] = count
-            files = [{"path": f.relative_to(work).as_posix(), "bytes": f.stat().st_size, "sha256": _sha256(f)}
-                     for f in sorted(work.rglob("*")) if f.is_file()]
+            files = []
+            for f in sorted(work.rglob("*")):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(work).as_posix()
+                sha = None
+                if rel in prev_sha and prev_dir is not None:
+                    try:                                    # the same inode is the same bytes: no need to read them
+                        if os.path.samefile(f, prev_dir / rel):
+                            sha = prev_sha[rel]
+                    except OSError:
+                        pass
+                files.append({"path": rel, "bytes": f.stat().st_size, "sha256": sha or _sha256(f)})
             manifest: dict[str, Any] = {
                 "service": self.service, "created_at": now,
                 "created": datetime.fromtimestamp(now, timezone.utc).isoformat(),
@@ -337,14 +440,43 @@ class StoreKeeper:
         d = self.root / snapshot_id
         return d if d.is_dir() and (d / "manifest.json").is_file() else None
 
-    def archive(self, snapshot_id: str) -> Optional[bytes]:
-        """One snapshot as a tar.gz, for a puller (Lodestar) to stash
-        elsewhere: the files exactly as they sit, manifest first, with the
-        snapshot's id as the top folder. None when there is no such snapshot."""
+    def manifest_files(self, snapshot_id: str) -> Optional[dict[str, str]]:
+        """{path: sha256} of one snapshot's files, or None when there is no
+        such snapshot: what an incremental archive is made against."""
         d = self.snapshot_dir(snapshot_id)
         if d is None:
             return None
-        return pack_snapshot(d)
+        try:
+            man = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+            return {f["path"]: f["sha256"] for f in man.get("files") or []}
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def archive(self, snapshot_id: str, since: Optional[str] = None) -> Optional[bytes]:
+        """One snapshot as a tar (compressed as `compress` says), in memory:
+        the files exactly as they sit, manifest first, with the snapshot's id
+        as the top folder. None when there is no such snapshot. `since`: a
+        snapshot the puller holds; its unchanged files are left out (see
+        the module docstring). For anything that might be big, archive_to."""
+        d = self.snapshot_dir(snapshot_id)
+        if d is None:
+            return None
+        return pack_snapshot(d, self.compress, skip=self.manifest_files(since) if since else None)
+
+    def archive_to(self, snapshot_id: str, out: Path, since: Optional[str] = None) -> Optional[Path]:
+        """The same archive written to `out` (a file path), for a route to
+        stream: the snapshot is never held in memory whole. Returns out, or
+        None when there is no such snapshot."""
+        d = self.snapshot_dir(snapshot_id)
+        if d is None:
+            return None
+        return pack_snapshot_to(d, out, self.compress, skip=self.manifest_files(since) if since else None)
+
+    @property
+    def archive_media(self) -> tuple[str, str]:
+        """(media type, file extension) of this keeper's archives."""
+        _, media, ext = COMPRESS[self.compress]
+        return media, ext
 
     # ── the rehearsal ─────────────────────────────────────────────────────
     @property
@@ -362,10 +494,11 @@ class StoreKeeper:
             return None
         return self._rehearse(d, "own", keep)
 
-    def rehearse_archive(self, data: bytes, keep: bool = False) -> dict[str, Any]:
-        """Rehearse restoring a snapshot that arrived as a tar.gz (from a
-        stash on another box). It is unpacked into scratch, never into the
-        snapshots folder, and removed afterwards."""
+    def rehearse_archive(self, data: Union[bytes, Path], keep: bool = False) -> dict[str, Any]:
+        """Rehearse restoring a snapshot that arrived as an archive (from a
+        stash on another box): its bytes, or the file they were saved to. It
+        is unpacked into scratch, never into the snapshots folder, and
+        removed afterwards."""
         incoming = self._scratch_root / f"incoming-{os.getpid()}-{time.time_ns()}"
         try:
             try:
@@ -400,6 +533,8 @@ class StoreKeeper:
             rep = rehearse_restore(d, scratch, self.check, keep)
             rep["source"] = source
             self.log(f"rehearsal of {d.name} ({source}): " + ("ok" if rep["ok"] else "FAILED: " + "; ".join(rep["problems"][:3])))
+            self._last_rehearsal = {"snapshot": d.name, "ok": rep["ok"], "source": source, "at": time.time(),
+                                    "seconds": rep.get("seconds"), "problems": len(rep.get("problems") or [])}
             return rep
         finally:
             self._rehearsing.release()
@@ -431,23 +566,108 @@ class StoreKeeper:
 
 
 # ── carrying a snapshot to another box ────────────────────────────────────────
-def pack_snapshot(d: Path) -> bytes:
-    """A snapshot folder as a tar.gz with the folder's name on top."""
+def _tar_mode(compress: str) -> str:
+    if compress not in COMPRESS:
+        raise ValueError(f"compress: '{compress}' is not one of {', '.join(COMPRESS)}")
+    suffix = COMPRESS[compress][0]
+    return f"w:{suffix}" if suffix else "w"
+
+
+def _pack_into(tar: tarfile.TarFile, d: Path, skip: Optional[dict[str, str]] = None) -> int:
+    """Add a snapshot folder to a tar, manifest first. `skip` ({path:
+    sha256}, a snapshot the receiver holds): a file with the same path and
+    sha256 in it is left out, and the receiver links it from there. Returns
+    how many were left out."""
+    tar.add(d / "manifest.json", arcname=f"{d.name}/manifest.json")
+    have: dict[str, str] = {}
+    if skip:
+        try:
+            man = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+            have = {f["path"]: f["sha256"] for f in man.get("files") or []}
+        except (OSError, ValueError, KeyError, TypeError):
+            have = {}
+    left_out = 0
+    for f in sorted(d.rglob("*")):
+        if not f.is_file() or f.name == "manifest.json":
+            continue
+        rel = f.relative_to(d).as_posix()
+        if skip and rel in skip and have.get(rel) == skip[rel]:
+            left_out += 1
+            continue
+        tar.add(f, arcname=f"{d.name}/{rel}")
+    return left_out
+
+
+def pack_snapshot(d: Path, compress: str = "gz", skip: Optional[dict[str, str]] = None) -> bytes:
+    """A snapshot folder as a tar with the folder's name on top, in memory.
+    Fine for a database; for a store that may hold pictures, pack_snapshot_to."""
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        tar.add(d / "manifest.json", arcname=f"{d.name}/manifest.json")
-        for f in sorted(d.rglob("*")):
-            if f.is_file() and f.name != "manifest.json":
-                tar.add(f, arcname=f"{d.name}/{f.relative_to(d).as_posix()}")
+    with tarfile.open(fileobj=buf, mode=_tar_mode(compress)) as tar:
+        _pack_into(tar, d, skip)
     return buf.getvalue()
 
 
-def unpack_snapshot(data: bytes, dest_root: Path, expect_id: Optional[str] = None) -> Path:
+def pack_snapshot_to(d: Path, out: Path, compress: str = "gz", skip: Optional[dict[str, str]] = None) -> Path:
+    """The same archive, written to `out` a file at a time. Written to
+    <out>.partial and renamed, so an archive that exists is whole."""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    work = out.with_name(out.name + ".partial")
+    try:
+        with tarfile.open(work, mode=_tar_mode(compress)) as tar:
+            _pack_into(tar, d, skip)
+        os.replace(work, out)
+    except BaseException:
+        try:
+            work.unlink()
+        except OSError:
+            pass
+        raise
+    return out
+
+
+def _link_missing(work: Path, link_from: Path) -> int:
+    """Every file the manifest names that the archive left out, hardlinked
+    (or copied) from the same path under `link_from`, when that snapshot's
+    manifest records the same sha256. Returns how many. What cannot be
+    filled is left missing: verify_snapshot says so and nothing is kept."""
+    try:
+        man = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+        prev = json.loads((link_from / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    prev_sha = {f.get("path"): f.get("sha256") for f in prev.get("files") or []}
+    linked = 0
+    for f in man.get("files") or []:
+        rel = f.get("path") or ""
+        if not rel or (work / rel).exists() or prev_sha.get(rel) != f.get("sha256"):
+            continue
+        src = link_from / rel
+        if not src.is_file():
+            continue
+        out = work / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, out)
+        except OSError:
+            shutil.copy2(src, out)
+        linked += 1
+    return linked
+
+
+def unpack_snapshot(data: Union[bytes, Path], dest_root: Path, expect_id: Optional[str] = None,
+                    link_from: Optional[Path] = None) -> Path:
     """Put an archived snapshot under dest_root/<id>/, verified against its
     manifest (every file present, every sha256 right) before it is kept: a
     snapshot that does not verify is not stashed. Written to <id>.partial and
-    renamed, like a snapshot being taken. Returns the folder."""
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+    renamed, like a snapshot being taken. Returns the folder. `data` is the
+    archive's bytes or the file they sit in; gz, xz or plain tar, whichever
+    the sender used. `link_from`: the stashed snapshot an incremental archive
+    was made against (?since=): what the archive left out is hardlinked from
+    there, then everything is checked."""
+    opened = (tarfile.open(str(data), mode="r:*") if isinstance(data, Path)
+              else tarfile.open(fileobj=io.BytesIO(data), mode="r:*"))
+    with opened as tar:
         names = tar.getnames()
         tops = {n.split("/", 1)[0] for n in names}
         if len(tops) != 1:
@@ -473,6 +693,8 @@ def unpack_snapshot(data: bytes, dest_root: Path, expect_id: Optional[str] = Non
             src = tar.extractfile(m)
             with open(out, "wb") as f:
                 shutil.copyfileobj(src, f)
+    if link_from is not None and Path(link_from).is_dir():
+        _link_missing(work, Path(link_from))
     problems = verify_snapshot(work)
     if problems:
         shutil.rmtree(work, ignore_errors=True)
@@ -518,6 +740,13 @@ def _is_sqlite(p: Path) -> bool:
             return f.read(16) == b"SQLite format 3\x00"
     except OSError:
         return False
+
+
+def _unlink_quietly(p: Path) -> None:
+    try:
+        Path(p).unlink()
+    except OSError:
+        pass
 
 
 def _remove_tree(d: Path) -> bool:
@@ -759,7 +988,7 @@ def restore_at_startup(service: str, stores: list[Store], source: str, reason: s
             work = receipts_dir / ".restore-incoming"
             _remove_tree(work)
             try:
-                snap = unpack_snapshot(src.read_bytes(), work)
+                snap = unpack_snapshot(src, work)
             except (ValueError, tarfile.TarError, OSError, EOFError) as e:
                 raise RestoreRefused(f"{src} could not be unpacked as a snapshot: {e}") from e
         elif (src / "manifest.json").is_file():
@@ -773,9 +1002,14 @@ def restore_at_startup(service: str, stores: list[Store], source: str, reason: s
         if man.get("service") != service:
             raise RestoreRefused(f"{src} is a snapshot of {man.get('service')}, and this service is {service}")
         held = [str(n) for n in man.get("stores") or []]
-        missing = [s.name for s in wanted if s.name not in held or not (snap / "raw" / s.name).is_dir()]
+        missing = [s.name for s in wanted if not s.optional and (s.name not in held or not (snap / "raw" / s.name).is_dir())]
         if missing:
             raise RestoreRefused(f"the snapshot does not hold {', '.join(missing)} (it holds {', '.join(held) or 'nothing'})")
+        # an optional store the snapshot predates starts empty, and the log says so
+        empty = [s.name for s in wanted if s.optional and (s.name not in held or not (snap / "raw" / s.name).is_dir())]
+        if empty:
+            log(f"the snapshot holds no {', '.join(empty)} (it was taken before this store existed): starting empty")
+        wanted = [s for s in wanted if s.name not in empty]
 
         tombs = {str(t["id"]): t for t in _tombstones_beside(snap) + list(extra_tombstones or []) if t.get("id")}
         receipts_dir.mkdir(parents=True, exist_ok=True)
@@ -838,7 +1072,8 @@ def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]],
     module docstring."""
     import asyncio
 
-    from starlette.responses import JSONResponse, Response
+    from starlette.background import BackgroundTask
+    from starlette.responses import FileResponse, JSONResponse
 
     def _off() -> JSONResponse:
         return JSONResponse({"ok": False, "error": "this service keeps no snapshots (backup.enabled is off)"},
@@ -884,12 +1119,29 @@ def add_store_routes(app: Any, get_keeper: Callable[[], Optional[StoreKeeper]],
         if archive_allowed is not None and not archive_allowed():
             return JSONResponse({"ok": False, "error": archive_refusal}, status_code=403)
         sid = request.path_params.get("snapshot_id", "")
-        data = await asyncio.to_thread(k.archive, sid)
-        if data is None:
+        if k.snapshot_dir(sid) is None:
             return JSONResponse({"ok": False, "error": f"no snapshot '{sid}'"}, status_code=404)
-        return Response(content=data, media_type="application/gzip",
-                        headers={"Content-Disposition": f'attachment; filename="{k.service}-{sid}.tar.gz"',
-                                 "X-Seren-Snapshot": sid, "X-Seren-Service": k.service})
+        # ?since=<id>: a snapshot the puller holds. Its unchanged files stay
+        # home, and the answer says which snapshot to link them from. A since
+        # this keeper no longer has means a full archive and no header.
+        since = (request.query_params.get("since") or "").strip() or None
+        if since and k.snapshot_dir(since) is None:
+            since = None
+        # written to a file and streamed from it: a store of pictures is not
+        # held in memory whole. The file goes when the response has gone.
+        media, ext = k.archive_media
+        out = k._scratch_root / f"archive-{sid}-{time.time_ns()}{ext}"
+        try:
+            path = await asyncio.to_thread(k.archive_to, sid, out, since)
+        except Exception as e:                              # noqa: BLE001
+            return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
+        if path is None:
+            return JSONResponse({"ok": False, "error": f"no snapshot '{sid}'"}, status_code=404)
+        headers = {"X-Seren-Snapshot": sid, "X-Seren-Service": k.service}
+        if since:
+            headers["X-Seren-Since"] = since
+        return FileResponse(str(path), media_type=media, filename=f"{k.service}-{sid}{ext}", headers=headers,
+                            background=BackgroundTask(_unlink_quietly, path))
 
     async def rehearse(request):                            # noqa: ANN001
         k = get_keeper()
@@ -948,7 +1200,8 @@ async def snapshot_loop(get_keeper: Callable[[], Optional[StoreKeeper]], every_h
         await asyncio.sleep(check_seconds)
 
 
-__all__ = ["Store", "StoreKeeper", "SnapshotBusy", "copy_store", "KINDS", "add_store_routes", "snapshot_loop",
-           "pack_snapshot", "unpack_snapshot", "verify_snapshot", "rehearse_restore", "RehearsalBusy",
+__all__ = ["Store", "StoreKeeper", "SnapshotBusy", "copy_store", "KINDS", "COMPRESS", "add_store_routes",
+           "snapshot_loop", "pack_snapshot", "pack_snapshot_to", "unpack_snapshot", "verify_snapshot",
+           "rehearse_restore", "RehearsalBusy",
            "restore_at_startup", "RestoreRefused", "restore_receipts", "pending_tombstones",
            "clear_pending_tombstones"]

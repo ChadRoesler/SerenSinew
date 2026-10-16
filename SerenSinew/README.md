@@ -74,6 +74,32 @@ probe = OnDemand(lodestar_url, "probe", holder="seren-workbench", token=lodestar
 client = httpx.AsyncClient(base_url=probe_url, transport=OnDemandTransport(probe))
 ```
 
+**What a service keeps, and snapshots of it** (`seren_sinew.stores`). A
+service declares its stores (`Store(name, kind, path)`: `sqlite`, `chroma`,
+`dir`, `file`, `blobs`) and gets the same routes as every other: `GET /stores`
+says what is kept, `POST /stores/snapshot` copies it the way its kind needs (a
+live SQLite database through the backup API), `GET /stores/snapshots` lists
+them, `.../archive` hands one over for Lodestar to stash, `.../rehearse` is a
+restore's dry run. Retention is the newest `keep_daily`, then one a week. The
+archive is a tar streamed from a file, `gz` by default; `compress="xz"` on the
+keeper for a store that is mostly database, `"none"` for one that is mostly
+pictures.
+
+**Files kept by what they are** (`seren_sinew.blobs`). A memory, a fact or a
+margin note can be about a picture; `BlobStore` keeps the bytes beside the
+database that keeps the row, named by their sha256 and nothing else, so they
+travel with it - same snapshot, same privacy, pruned when the row goes. As a
+`blobs` store, a snapshot hardlinks every file the previous snapshot already
+holds: twenty-two kept snapshots of a video cost one video.
+
+```python
+from seren_sinew.blobs import BlobStore
+
+keep = BlobStore("~/.seren-margin/keepsakes", max_bytes=512 << 20, max_total=64 << 30)
+blob = keep.put(png_bytes)          # Blob(digest, bytes, mime, ext, existed)
+stores = [Store("notes", "sqlite", db_path), keep.store("keepsakes", "pictures kept with the notes")]
+```
+
 ## What's coming
 
 The cluster client, discovery and the DTOs that Lodestar and Observatory

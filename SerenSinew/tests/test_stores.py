@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -307,6 +308,186 @@ def test_a_service_can_keep_its_archives_to_itself(tmp_path):
         assert c.get(f"/stores/snapshots/{sid}/archive").status_code == 200
 
 
+# ── a blobs store: pictures kept with the rows about them ─────────────────────
+PNG = bytes.fromhex("89504e470d0a1a0a") + b"\x00" * 40
+
+
+def test_a_blobs_store_shares_unchanged_files_between_snapshots_by_hardlink(tmp_path):
+    """15 Oct 2026: pictures and clips are the only thing that gets big, and
+    they never change once kept. Twenty-two snapshots of one video must cost
+    one video, and a day's snapshot must not read a gigabyte nobody touched."""
+    import os
+    from seren_sinew.blobs import INCOMING, BlobStore
+    from seren_sinew.stores import _sha256, restore_at_startup, verify_snapshot
+    bs = BlobStore(tmp_path / "keep")
+    a, b = bs.put(PNG).digest, bs.put(b"\xff\xd8\xff" + b"b" * 5000).digest
+    (tmp_path / "keep" / INCOMING / "half.partial").write_bytes(b"half")
+    (tmp_path / "keep" / "stray.txt").write_text("not a blob")
+    k = _keeper(tmp_path, [bs.store("keepsakes", "pictures")])
+    one = Path(k.snapshot("first")["path"])
+    raw1 = one / "raw" / "keepsakes"
+    assert sorted(p.name for p in raw1.rglob("*") if p.is_file()) == sorted([a, b]), ".incoming and strays are not the store"
+    assert not os.path.samefile(bs.path(a), raw1 / a[:2] / a), "the first copy is a real copy, not a link to the live file"
+
+    c = bs.put(b"GIF89a" + b"c" * 300).digest
+    reads = {"n": 0}
+    real = _sha256
+    import seren_sinew.stores as stores_mod
+
+    def counting(p):
+        reads["n"] += 1
+        return real(p)
+    stores_mod._sha256 = counting
+    try:
+        two = Path(k.snapshot("second")["path"])
+    finally:
+        stores_mod._sha256 = real
+    raw2 = two / "raw" / "keepsakes"
+    assert os.path.samefile(raw1 / a[:2] / a, raw2 / a[:2] / a) and os.path.samefile(raw1 / b[:2] / b, raw2 / b[:2] / b)
+    assert not os.path.samefile(raw2 / c[:2] / c, bs.path(c))
+    assert reads["n"] == 1, "only the new blob was hashed; the linked two were not read"
+    man = json.loads((two / "manifest.json").read_text())
+    assert {f["path"].rsplit("/", 1)[1]: f["sha256"] for f in man["files"]} == {a: a, b: b, c: c}, "a blob's hash is its name"
+    assert verify_snapshot(two) == []
+
+    k.keep_daily, k.keep_weekly = 1, 0
+    assert k.prune() == [one.name]
+    assert verify_snapshot(two) == [] and (raw2 / a[:2] / a).read_bytes() == PNG, "the shared files stand when one snapshot goes"
+
+    # and a restore lays the folder back out
+    got = restore_at_startup("seren-test", [BlobStore(tmp_path / "fresh").store("keepsakes")], str(two), "a new box",
+                             tmp_path / "receipts")
+    assert got["restored"] and got["files"] == 3
+    assert BlobStore(tmp_path / "fresh").read(a) == PNG
+
+
+def test_an_archive_is_gz_xz_or_plain_and_is_read_whichever_it_is(tmp_path):
+    from seren_sinew.stores import COMPRESS, pack_snapshot_to, unpack_snapshot
+    f = tmp_path / "notes.db"
+    f.write_text("".join(f"note {i}: the {i * 7 % 13}th thing about the {i % 29}th day\n" for i in range(20000)))
+    snaps = {}
+    for how in COMPRESS:
+        k = _keeper(tmp_path / how, [Store("notes", "file", str(f))], compress=how)
+        sid = k.snapshot()["id"]
+        snaps[how] = (k, sid, k.archive(sid))
+    gz, xz, raw = (snaps[h][2] for h in ("gz", "xz", "none"))
+    assert gz[:2] == b"\x1f\x8b" and xz[:6] == b"\xfd7zXZ\x00" and raw[257:262] == b"ustar"
+    assert len(xz) < len(gz) < len(raw)
+    for how, (k, sid, data) in snaps.items():
+        got = unpack_snapshot(data, tmp_path / "stash" / how)         # r:* - whichever it is
+        assert (got / "raw" / "notes" / "notes.db").read_text() == f.read_text()
+    assert snaps["xz"][0].archive_media == ("application/x-xz", ".tar.xz")
+    with pytest.raises(ValueError, match="compress: 'zip' is not one of gz, xz, none"):
+        _keeper(tmp_path / "bad", [Store("notes", "file", str(f))], compress="zip")
+    # streamed to a file, read from a file: the way a route hands one over
+    k, sid, _ = snaps["xz"]
+    out = pack_snapshot_to(k.snapshot_dir(sid), tmp_path / "out" / "a.tar.xz", "xz")
+    assert out.read_bytes()[:6] == b"\xfd7zXZ\x00" and not list((tmp_path / "out").glob("*.partial"))
+    assert unpack_snapshot(out, tmp_path / "stash2").name == sid
+
+
+def test_describe_says_when_the_stash_last_caught_up_and_how_the_last_rehearsal_went(tmp_path):
+    """What a viewer's backup panel shows, the same on every service."""
+    f = tmp_path / "a.json"
+    f.write_text("x")
+    k = _keeper(tmp_path, [Store("a", "file", str(f))])
+    d = k.describe()
+    assert d["snapshots"]["last_pull"] is None and d["last_rehearsal"] is None
+    k.snapshot("scheduled")
+    pulled = k.snapshot("Lodestar pull (scheduled)")
+    k.snapshot("by hand")
+    d = k.describe()
+    assert d["snapshots"]["count"] == 3 and d["snapshots"]["last_pull"]["id"] == pulled["id"]
+    assert d["snapshots"]["last_pull"]["reason"] == "Lodestar pull (scheduled)"
+    rep = k.rehearse()
+    last = k.describe()["last_rehearsal"]
+    assert last["ok"] is rep["ok"] is True and last["snapshot"] == rep["snapshot"] and last["source"] == "own"
+    assert last["problems"] == 0 and set(last) == {"snapshot", "ok", "source", "at", "seconds", "problems"}, "counts, never words"
+
+
+def test_an_incremental_archive_leaves_home_what_the_puller_holds_and_the_stash_links_it(tmp_path):
+    """15 Oct 2026: a stash of twenty-two snapshots of a gigabyte of pictures
+    must carry one gigabyte over the wire and hold one on disk."""
+    import os
+    import tarfile
+    from seren_sinew.blobs import BlobStore
+    from seren_sinew.stores import unpack_snapshot, verify_snapshot
+    bs = BlobStore(tmp_path / "keep")
+    a = bs.put(PNG).digest
+    db = tmp_path / "notes.db"
+    db.write_text("day one")
+    k = _keeper(tmp_path, [Store("notes", "file", str(db)), bs.store("keepsakes")])
+    first = k.snapshot("one")["id"]
+    db.write_text("day two")                                  # the database changes every day; the picture never
+    b = bs.put(b"\xff\xd8\xff" + b"b" * 300).digest
+    second = k.snapshot("two")["id"]
+
+    # the puller: a stash that holds `first`, asking for `second` since it
+    stash = tmp_path / "stash"
+    unpack_snapshot(k.archive(first), stash)
+    data = k.archive(second, since=first)
+    with tarfile.open(fileobj=__import__("io").BytesIO(data), mode="r:*") as tar:
+        names = {n.split("/", 1)[1] for n in tar.getnames() if "/" in n}
+    assert names == {"manifest.json", "raw/notes/notes.db", f"raw/keepsakes/{b[:2]}/{b}"}, "the unchanged picture stayed home"
+    got = unpack_snapshot(data, stash, expect_id=second, link_from=stash / first)
+    assert verify_snapshot(got) == [], "whole on arrival: the missing picture was linked from the stash's copy"
+    assert os.path.samefile(got / "raw" / "keepsakes" / a[:2] / a, stash / first / "raw" / "keepsakes" / a[:2] / a)
+    assert (got / "raw" / "notes" / "notes.db").read_text() == "day two"
+    # without the previous snapshot to link from, a partial archive is refused, not half-kept
+    with pytest.raises(ValueError, match="did not verify"):
+        unpack_snapshot(data, tmp_path / "stash2", expect_id=second)
+    assert not (tmp_path / "stash2" / second).exists()
+    # a since the service does not have: a full archive
+    full = k.archive(second, since="20000101-000000")
+    assert len(full) > len(data) and unpack_snapshot(full, tmp_path / "stash3").name == second
+    assert k.manifest_files("nope") is None and set(k.manifest_files(first)) == {"raw/notes/notes.db", f"raw/keepsakes/{a[:2]}/{a}"}
+
+
+def test_the_archive_route_honours_since(tmp_path):
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+    from seren_sinew.blobs import BlobStore
+    from seren_sinew.stores import add_store_routes, unpack_snapshot
+    bs = BlobStore(tmp_path / "keep")
+    bs.put(PNG)
+    k = _keeper(tmp_path, [bs.store("keepsakes")])
+    app = Starlette()
+    add_store_routes(app, lambda: k)
+    with TestClient(app) as c:
+        first = c.post("/stores/snapshot").json()["snapshot"]["id"]
+        second = c.post("/stores/snapshot").json()["snapshot"]["id"]
+        full = c.get(f"/stores/snapshots/{second}/archive")
+        part = c.get(f"/stores/snapshots/{second}/archive", params={"since": first})
+        assert "x-seren-since" not in full.headers and part.headers["x-seren-since"] == first
+        assert len(part.content) < len(full.content)
+        unknown = c.get(f"/stores/snapshots/{second}/archive", params={"since": "20000101-000000"})
+        assert "x-seren-since" not in unknown.headers and len(unknown.content) == len(full.content)
+        stash = tmp_path / "stash"
+        unpack_snapshot(full.content, stash)                 # (second, whole)
+        unpack_snapshot(c.get(f"/stores/snapshots/{first}/archive").content, stash)
+        got = unpack_snapshot(part.content, tmp_path / "stash-b", expect_id=second, link_from=stash / first)
+        assert got.name == second
+
+
+def test_the_archive_route_streams_a_file_and_cleans_up(tmp_path):
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+    from seren_sinew.stores import add_store_routes, unpack_snapshot
+    f = tmp_path / "a.json"
+    f.write_text("x")
+    k = _keeper(tmp_path, [Store("a", "file", str(f))], compress="xz")
+    app = Starlette()
+    add_store_routes(app, lambda: k)
+    with TestClient(app) as c:
+        sid = c.post("/stores/snapshot").json()["snapshot"]["id"]
+        r = c.get(f"/stores/snapshots/{sid}/archive")
+        assert r.status_code == 200 and r.headers["content-type"] == "application/x-xz"
+        assert r.headers["content-disposition"] == f'attachment; filename="seren-test-{sid}.tar.xz"'
+        assert unpack_snapshot(r.content, tmp_path / "stash", expect_id=sid).name == sid
+        assert not list((k.root / ".rehearsal").glob("archive-*")), "the file it was streamed from is gone"
+        assert [s["id"] for s in k.list()] == [sid], "and was never mistaken for a snapshot"
+
+
 # ── the rehearsal: a restore's dry run ────────────────────────────────────────
 def _counting_keeper(tmp_path, live_rows=3, tombstoned=("row 1",)):
     """A keeper over one live SQLite database whose check counts the restored
@@ -508,6 +689,14 @@ def test_a_restore_that_cannot_be_done_as_asked_stops_the_service(tmp_path):
         with pytest.raises(RestoreRefused, match=says):
             restore_at_startup(kw.get("service", "seren-test"), kw.get("stores", stores), kw["source"], kw["reason"], receipts)
     assert not (tmp_path / "new" / "store").exists(), "refused before anything was copied"
+    # a store grown after the snapshots began may start empty, and the log says so
+    said: list[str] = []
+    grown = stores + [Store("keepsakes", "blobs", str(tmp_path / "new" / "keep"), optional=True)]
+    rep = restore_at_startup("seren-test", grown, snap, "a new box", tmp_path / "new" / "r2", log=said.append)
+    assert rep["restored"] and rep["stores"] == ["it", "state"] and not (tmp_path / "new" / "keep").exists()
+    assert any("holds no keepsakes" in m and "starting empty" in m for m in said)
+    shutil.rmtree(tmp_path / "new" / "store")
+    shutil.rmtree(tmp_path / "new" / "state")
     # an archive works as a source; a damaged one is refused
     tar = tmp_path / "snap.tar.gz"
     tar.write_bytes(pack_snapshot(k.snapshot_dir(second)))

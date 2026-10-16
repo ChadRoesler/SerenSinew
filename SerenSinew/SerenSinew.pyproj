@@ -22,9 +22,13 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="seren_sinew\blobs.py" />
     <Compile Include="seren_sinew\request_log.py" />
+    <Compile Include="seren_sinew\stores.py" />
     <Compile Include="seren_sinew\__init__.py" />
+    <Compile Include="tests\test_blobs.py" />
     <Compile Include="tests\test_request_log.py" />
+    <Compile Include="tests\test_stores.py" />
   </ItemGroup>
   <ItemGroup>
     <Folder Include="seren_sinew\" />
