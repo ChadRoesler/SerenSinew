@@ -106,3 +106,94 @@ def test_belay_comes_back_with_the_check_that_let_go(box):
     b = box.belay("claude")
     assert isinstance(b, BelayReport) and not b.ok and not b.error
     assert b.checks[0]["status"] == "LET GO" and b.node == "desktop"
+
+
+# ── upgrades (23 Oct 2026) ───────────────────────────────────────────
+
+FAKE_MAIN = textwrap.dedent('''
+    import json, os, re, shutil, sys, zipfile
+    args = sys.argv[1:]
+    def version(p):
+        return re.search(r'"(.+)"', zipfile.ZipFile(p).read("kbh/__init__.py").decode()).group(1)
+    if args[:1] == ["upgrade"]:
+        into, frm = args[args.index("--into") + 1], args[args.index("--from") + 1]
+        was, now = version(into), version(frm)
+        with open(os.path.join(os.path.dirname(into), "ran-by.txt"), "w") as f:
+            f.write(os.path.basename(sys.argv[0]))
+        shutil.copyfile(frm, into)
+        print("kbh: a warning first", file=sys.stderr)
+        print(json.dumps({"ok": True, "was": was, "now": now, "changed": True, "sha256_checked": "--sha256" in args,
+                          "belay": {"claude": {"lost": [], "after_ok": True}}, "from_the_future": 1}))
+''')
+
+
+def _zip_kbh(path, version, build="", upgrade=True) -> bytes:
+    import zipfile
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("__main__.py", FAKE_MAIN)
+        zf.writestr("kbh/__init__.py", f'__version__ = "{version}"\n')
+        if build:
+            zf.writestr("kbh/_build.py", f"BUILD = {build!r}\n")
+        if upgrade:
+            zf.writestr("kbh/upgrade.py", "")
+    return path.read_bytes()
+
+
+@pytest.fixture
+def zbox(tmp_path):
+    folder = tmp_path / "zkbh"
+    folder.mkdir()
+    _zip_kbh(folder / "claude.kbh", "5.1.3", "1f116ed")
+    (folder / "claude.yaml").write_text("carabiner: claude\n", encoding="utf-8")
+    new = _zip_kbh(tmp_path / "new.kbh", "5.1.4", "abc1234")
+    return KbhRunner(folder=str(folder), python=sys.executable, node="desktop", timeout_seconds=5), folder, new
+
+
+def test_the_upgrade_messages_carry_the_file_and_its_hash():
+    import hashlib
+    from seren_sinew.carabiners import UpgradeRequest, UpgradeResult
+    req = UpgradeRequest.carrying(b"PK-ish bytes", node="spark", version="5.1.4", source="release v5.1.4")
+    assert req.sha256 == hashlib.sha256(b"PK-ish bytes").hexdigest() and req.data() == b"PK-ish bytes"
+    back = UpgradeRequest.from_dict({**req.to_dict(), "sha256": req.sha256.upper(), "extra": 1})
+    assert back == req, "the hash is compared lower-case; unknown fields are shrugged off"
+    with pytest.raises(ValueError):
+        UpgradeRequest(kbh="not base64!!").data()
+    with pytest.raises(ValueError):
+        UpgradeRequest(kbh="").data()
+    res = UpgradeResult.from_dict({"ok": True, "belay": {"claude": {"lost": ["x"]}}, "belay_extra": 2})
+    assert res.belay == {"claude": {"lost": ["x"]}} and UpgradeResult.from_dict(res.to_dict()) == res
+
+
+def test_list_says_each_kbh_version_and_hash_without_running_it(zbox):
+    import hashlib
+    runner, folder, _ = zbox
+    (e,) = runner.list()
+    assert e.version == "5.1.3+1f116ed"
+    assert e.sha256 == hashlib.sha256((folder / "claude.kbh").read_bytes()).hexdigest()
+    assert not (folder / "ran-by.txt").exists()
+
+
+def test_upgrade_checks_the_hash_then_the_installed_kbh_swaps_it_in(zbox):
+    from seren_sinew.carabiners import UpgradeRequest
+    runner, folder, new = zbox
+    bad = UpgradeRequest.carrying(new)
+    bad.sha256 = "0" * 64
+    r = runner.upgrade("claude", bad)
+    assert not r.ok and "damaged on the way" in r.error and not (folder / "ran-by.txt").exists()
+    r = runner.upgrade("claude", UpgradeRequest(kbh=UpgradeRequest.carrying(new).kbh))
+    assert not r.ok and "sha256" in r.error, "no hash, no upgrade"
+    r = runner.upgrade("claude", UpgradeRequest.carrying(new))
+    assert r.ok and r.was == "5.1.3" and r.now == "5.1.4" and r.sha256_checked and r.node == "desktop", r.error
+    assert (folder / "ran-by.txt").read_text() == "claude.kbh", "the file already trusted runs it"
+    assert (folder / "claude.kbh").read_bytes() == new and not r.bootstrap
+    assert [p.name for p in folder.iterdir() if "incoming" in p.name] == [], "the incoming file is cleaned up"
+    assert runner.upgrade("toaster", UpgradeRequest.carrying(new)).error.startswith("LookupError")
+
+
+def test_a_kbh_from_before_the_upgrade_verb_is_upgraded_by_the_new_one(zbox):
+    from seren_sinew.carabiners import UpgradeRequest
+    runner, folder, new = zbox
+    _zip_kbh(folder / "claude.kbh", "5.1.2", upgrade=False)
+    r = runner.upgrade("claude", UpgradeRequest.carrying(new))
+    assert r.ok and r.bootstrap and r.was == "5.1.2", r.error
+    assert (folder / "ran-by.txt").read_text().startswith(".claude.kbh.incoming-")

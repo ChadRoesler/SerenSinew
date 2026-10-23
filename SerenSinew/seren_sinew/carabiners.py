@@ -24,6 +24,7 @@ between them.
     GET  /api/v1/carabiner/{carabiner}/settings      -> CarabinerManifest
     POST /api/v1/carabiner/{carabiner}/settings      SettingsRequest -> SettingsResult
     GET  /api/v1/carabiner/{carabiner}/belay         -> BelayReport
+    POST /api/v1/carabiner/{carabiner}/upgrade       UpgradeRequest -> UpgradeResult
 
 The Observatory answers for the carabiners on its own box; Lodestar answers
 for the cluster, choosing the Observatory by the request's `node` (`?node=`
@@ -36,13 +37,27 @@ root or LocalSystem service never writes someone's yaml as itself. The
 request reaches kbh in KBH_SETTINGS_REQUEST, not on stdin: a process started
 in another person's Windows session gets no stdin (seren_sinew.runas).
 Tokens never travel this road.
+
+UPGRADES (23 Oct 2026). Lodestar pulls a .kbh (a GitHub release, or one put
+on its shelf by hand) and sends the file itself, base64 with its sha256, so a
+harness box never has to reach the internet. The Observatory checks the hash,
+writes the file beside the one it replaces, and has the INSTALLED .kbh run
+`kbh upgrade` as the person: belay before, swap, belay after, the old one put
+back if anything that held lets go. A .kbh from before 5.1.3 has no upgrade
+verb; then the new file runs it (`--into` the old one), once.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import os
 import re
+import secrets
 import tempfile
+import threading
+import zipfile
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
@@ -52,10 +67,13 @@ from . import runas
 LIST_PATH = "/api/v1/carabiners"
 SETTINGS_PATH = "/api/v1/carabiner/{carabiner}/settings"
 BELAY_PATH = "/api/v1/carabiner/{carabiner}/belay"
+UPGRADE_PATH = "/api/v1/carabiner/{carabiner}/upgrade"
 
 REQUEST_ENV = "KBH_SETTINGS_REQUEST"
 MAX_REQUEST = 30000            # characters: a Windows environment variable holds 32767
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
+MAX_KBH = 8 * 1024 * 1024      # bytes: a .kbh is ~160KB, the all-in-one ~210KB
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _known(cls, d: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -191,11 +209,15 @@ class BelayReport:
 @dataclass
 class CarabinerEntry:
     """One carabiner clipped on a box: a <name>.kbh in the folder, with its
-    <name>.yaml beside it (configured false until there is one)."""
+    <name>.yaml beside it (configured false until there is one). version and
+    sha256 are read from the file, not by running it: what Lodestar compares
+    with its shelf to say who is behind."""
     carabiner: str = ""
     node: str = ""
     kbh: str = ""
     configured: bool = False
+    version: str = ""                                   # 5.1.3+1f116ed; 5.1.2 from before builds were stamped
+    sha256: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -204,7 +226,121 @@ class CarabinerEntry:
     def from_dict(cls, d: Optional[dict[str, Any]]) -> "CarabinerEntry":
         k = _known(cls, d)
         return cls(carabiner=str(k.get("carabiner") or ""), node=str(k.get("node") or ""),
-                   kbh=str(k.get("kbh") or ""), configured=bool(k.get("configured")))
+                   kbh=str(k.get("kbh") or ""), configured=bool(k.get("configured")),
+                   version=str(k.get("version") or ""), sha256=str(k.get("sha256") or ""))
+
+
+@dataclass
+class UpgradeRequest:
+    """Put this .kbh where the box's <carabiner>.kbh is. `kbh` is the file,
+    base64; `sha256` is required and checked on arrival, before anything of
+    it runs. `version` and `source` are what the sender says, for the logs:
+    the file says its own version once it is there."""
+    node: str = ""
+    kbh: str = ""
+    sha256: str = ""
+    version: str = ""
+    source: str = ""                                    # "release v5.1.3", "shelf"
+    downgrade: bool = False                             # an older version is taken
+    holder: str = ""
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def carrying(cls, data: bytes, **kw: Any) -> "UpgradeRequest":
+        return cls(kbh=base64.b64encode(data).decode("ascii"), sha256=hashlib.sha256(data).hexdigest(), **kw)
+
+    def data(self) -> bytes:
+        """The file's bytes. ValueError for one too big or not base64."""
+        if len(self.kbh) > (MAX_KBH * 4) // 3 + 4:
+            raise ValueError(f"the .kbh is bigger than {MAX_KBH} bytes")
+        try:
+            data = base64.b64decode(self.kbh, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(f"the .kbh is not base64: {e}") from e
+        if not data:
+            raise ValueError("no .kbh came with the request")
+        return data
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict[str, Any]]) -> "UpgradeRequest":
+        k = _known(cls, d)
+        return cls(node=str(k.get("node") or "")[:120], kbh=str(k.get("kbh") or ""),
+                   sha256=str(k.get("sha256") or "").strip().lower()[:64], version=str(k.get("version") or "")[:80],
+                   source=str(k.get("source") or "")[:200], downgrade=bool(k.get("downgrade")),
+                   holder=str(k.get("holder") or "")[:120], reason=str(k.get("reason") or "")[:200])
+
+
+@dataclass
+class UpgradeResult:
+    """`kbh upgrade --json`, carried. ok with changed false: it was already
+    that build. rolled_back: the new one let go of what the old one held
+    (belay: carabiner -> {before_ok, after_ok, lost, new_let_go}) and the old
+    one is back. bootstrap: the old .kbh had no upgrade verb, so the new one
+    ran it."""
+    ok: bool = False
+    carabiner: str = ""
+    node: str = ""
+    was: str = ""
+    now: str = ""
+    changed: bool = False
+    rolled_back: bool = False
+    backup: str = ""
+    sha256: str = ""
+    sha256_checked: bool = False
+    bootstrap: bool = False
+    belay: dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict[str, Any]]) -> "UpgradeResult":
+        k = _known(cls, d)
+        belay = k.get("belay") if isinstance(k.get("belay"), dict) else {}
+        return cls(ok=bool(k.get("ok")), carabiner=str(k.get("carabiner") or ""), node=str(k.get("node") or ""),
+                   was=str(k.get("was") or ""), now=str(k.get("now") or ""), changed=bool(k.get("changed")),
+                   rolled_back=bool(k.get("rolled_back")), backup=str(k.get("backup") or ""),
+                   sha256=str(k.get("sha256") or ""), sha256_checked=bool(k.get("sha256_checked")),
+                   bootstrap=bool(k.get("bootstrap")), belay=dict(belay), error=str(k.get("error") or ""))
+
+    @classmethod
+    def failed(cls, carabiner: str, error: str, node: str = "") -> "UpgradeResult":
+        return cls(ok=False, carabiner=carabiner, node=node, error=error)
+
+
+_VERSION = re.compile(r"""__version__\s*=\s*["']([^"']+)""")
+_BUILD = re.compile(r"""BUILD\s*=\s*["']([^"']*)""")
+
+
+def kbh_identity(path: str) -> tuple[str, str]:
+    """(version, sha256) of a .kbh, read from the zip, never run: the
+    version kbh/__init__.py says and the build kbh/_build.py stamps."""
+    data = Path(path).read_bytes()
+    version = ""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            m = _VERSION.search(zf.read("kbh/__init__.py").decode("utf-8", "replace"))
+            version = m.group(1) if m else ""
+            if version and "kbh/_build.py" in zf.namelist():
+                b = _BUILD.search(zf.read("kbh/_build.py").decode("utf-8", "replace"))
+                if b and b.group(1):
+                    version += "+" + b.group(1)
+    except (zipfile.BadZipFile, KeyError, OSError):
+        pass
+    return version, hashlib.sha256(data).hexdigest()
+
+
+def has_upgrade_verb(path: str) -> bool:
+    """Whether this .kbh can upgrade itself (5.1.3 on)."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return "kbh/upgrade.py" in zf.namelist()
+    except (zipfile.BadZipFile, OSError):
+        return False
 
 
 # ── running kbh on this box ──────────────────────────────────────────
@@ -234,12 +370,15 @@ class KbhRunner:
     carabiner, and only one whose .kbh is in the folder is run."""
 
     def __init__(self, *, folder: str, python: str, run_as: str = "", timeout_seconds: float = 60.0,
-                 node: str = "") -> None:
+                 node: str = "", upgrade_timeout_seconds: float = 600.0) -> None:
         self.folder = os.path.abspath(os.path.expanduser(folder)) if folder else ""
         self.python = python
         self.run_as = run_as or ""
         self.timeout_seconds = float(timeout_seconds)
+        # An upgrade belays twice, and a belay waits on every service the yaml names.
+        self.upgrade_timeout_seconds = float(upgrade_timeout_seconds)
         self.node = node
+        self._upgrading = threading.Lock()
 
     def list(self) -> list[CarabinerEntry]:
         if not self.folder or not os.path.isdir(self.folder):
@@ -247,8 +386,12 @@ class KbhRunner:
         out = []
         for p in sorted(Path(self.folder).glob("*.kbh")):
             if NAME.fullmatch(p.stem):
+                try:
+                    version, sha = kbh_identity(str(p))
+                except OSError:
+                    version, sha = "", ""
                 out.append(CarabinerEntry(carabiner=p.stem, node=self.node, kbh=str(p),
-                                          configured=(p.with_suffix(".yaml")).is_file()))
+                                          configured=(p.with_suffix(".yaml")).is_file(), version=version, sha256=sha))
         return out
 
     def _paths(self, carabiner: str) -> tuple[str, str]:
@@ -264,17 +407,19 @@ class KbhRunner:
         that is not here, runas.RunAsRefused / OSError when it cannot start,
         TimeoutError when it ran too long (it is killed)."""
         kbh, yaml = self._paths(carabiner)
+        return self._exec([self.python, kbh, carabiner, *args, "--config", yaml], env, self.timeout_seconds,
+                          f"kbh {carabiner} {args[0] if args else ''}")
+
+    def _exec(self, argv: list[str], env: Optional[dict[str, str]], timeout: float, what: str) -> tuple[int, str]:
         fd, out_path = tempfile.mkstemp(prefix="kbh-", suffix=".out")
         try:
             with os.fdopen(fd, "wb") as out:
-                proc = runas.spawn([self.python, kbh, carabiner, *args, "--config", yaml], run_as=self.run_as,
-                                   env=env, cwd=self.folder, stdout=out)
+                proc = runas.spawn(argv, run_as=self.run_as, env=env, cwd=self.folder, stdout=out)
                 try:
-                    rc = proc.wait(timeout=self.timeout_seconds)
+                    rc = proc.wait(timeout=timeout)
                 except Exception as e:  # noqa: BLE001 - subprocess.TimeoutExpired, or the session process's own
                     proc.kill()
-                    raise TimeoutError(f"kbh {carabiner} {args[0] if args else ''} ran past "
-                                       f"{self.timeout_seconds:g}s and was stopped") from e
+                    raise TimeoutError(f"{what} ran past {timeout:g}s and was stopped") from e
             with open(out_path, encoding="utf-8", errors="replace") as f:
                 return int(rc if rc is not None else 1), f.read()
         finally:
@@ -315,3 +460,52 @@ class KbhRunner:
         except Exception as e:  # noqa: BLE001
             return BelayReport.failed(carabiner, f"{type(e).__name__}: {e}", self.node)
         return BelayReport(ok=bool(d.get("ok")), carabiner=carabiner, node=self.node, checks=_dicts(d.get("checks")))
+
+    def upgrade(self, carabiner: str, req: UpgradeRequest) -> UpgradeResult:
+        """Check the file that came, put it beside <carabiner>.kbh, and have
+        kbh swap it in AS the person (kbh.upgrade has the steps). One at a
+        time on a box; the incoming file is gone afterwards either way."""
+        try:
+            kbh, yaml = self._paths(carabiner)
+        except LookupError as e:
+            return UpgradeResult.failed(carabiner, f"LookupError: {e}", self.node)
+        if not SHA256.fullmatch(req.sha256 or ""):
+            return UpgradeResult.failed(carabiner, "an upgrade carries the file's sha256; this one did not", self.node)
+        try:
+            data = req.data()
+        except ValueError as e:
+            return UpgradeResult.failed(carabiner, str(e), self.node)
+        got = hashlib.sha256(data).hexdigest()
+        if got != req.sha256:
+            return UpgradeResult.failed(carabiner, f"the file that arrived has sha256 {got}, not {req.sha256}: "
+                                                   f"damaged on the way; nothing was written", self.node)
+        if not self._upgrading.acquire(blocking=False):
+            return UpgradeResult.failed(carabiner, "an upgrade is already running on this box", self.node)
+        incoming = os.path.join(self.folder, f".{carabiner}.kbh.incoming-{secrets.token_hex(4)}")
+        try:
+            with open(incoming, "wb") as f:
+                f.write(data)
+            os.chmod(incoming, 0o644)                    # written by the service, read by the person
+            bootstrap = not has_upgrade_verb(kbh)
+            argv = [self.python, incoming if bootstrap else kbh, "upgrade", "--into", kbh, "--from", incoming,
+                    "--sha256", got, "--json"]
+            if os.path.isfile(yaml):
+                argv += ["--config", yaml]
+            if req.downgrade:
+                argv.append("--downgrade")
+            rc, text = self._exec(argv, None, self.upgrade_timeout_seconds, f"kbh upgrade of {carabiner}")
+            d = _last_json(text)
+            if d is None:
+                return UpgradeResult.failed(carabiner, f"kbh upgrade answered no JSON (exit {rc}): "
+                                                       f"{text.strip()[-300:]}", self.node)
+            r = UpgradeResult.from_dict(d)
+            r.carabiner, r.node, r.bootstrap = carabiner, self.node, bootstrap
+            return r
+        except Exception as e:  # noqa: BLE001 - an answer, not a 500
+            return UpgradeResult.failed(carabiner, f"{type(e).__name__}: {e}", self.node)
+        finally:
+            try:
+                os.unlink(incoming)
+            except OSError:
+                pass
+            self._upgrading.release()
