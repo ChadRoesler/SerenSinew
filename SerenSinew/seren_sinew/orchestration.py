@@ -60,6 +60,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from .atomic import write_json
+
 ENSURE_PATH = "/api/v1/service/{service}/ensure"
 RELEASE_PATH = "/api/v1/service/{service}/release"
 
@@ -322,11 +324,7 @@ class Leases:
 
     def save(self, path: "os.PathLike[str] | str") -> None:
         """Atomic: a crash mid-write leaves the last good book."""
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
-        os.replace(tmp, p)
+        write_json(path, self.to_dict())
 
     @classmethod
     def load(cls, path: "os.PathLike[str] | str", default_ttl: Optional[float] = None) -> "Leases":

@@ -41,6 +41,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from .orchestration import ENSURE_PATH, RELEASE_PATH, EnsureRequest, EnsureResult, ReleaseRequest
+from .request_log import request_id_hooks
 
 log = logging.getLogger("seren_sinew.ondemand")
 
@@ -96,7 +97,8 @@ class OnDemand:
         async with self._alock:
             try:
                 async with httpx.AsyncClient(transport=self._transport, headers=self._headers,
-                                             timeout=self.wait_seconds + 60.0) as c:
+                                             timeout=self.wait_seconds + 60.0,
+                                             event_hooks=request_id_hooks(asynchronous=True)) as c:
                     r = await c.post(self._url(ENSURE_PATH), json=self._request(reason))
                 return self._took(r.json() if r.content else {})
             except (httpx.HTTPError, ValueError) as e:
@@ -105,7 +107,8 @@ class OnDemand:
 
     async def release(self, reason: str = "done") -> bool:
         try:
-            async with httpx.AsyncClient(transport=self._transport, headers=self._headers, timeout=60.0) as c:
+            async with httpx.AsyncClient(transport=self._transport, headers=self._headers, timeout=60.0,
+                                         event_hooks=request_id_hooks(asynchronous=True)) as c:
                 r = await c.post(self._url(RELEASE_PATH), json=ReleaseRequest(holder=self.holder, reason=reason).to_dict())
             self._renewed_at = None
             return r.is_success
@@ -117,7 +120,7 @@ class OnDemand:
         with self._slock:
             try:
                 with httpx.Client(transport=self._sync_transport, headers=self._headers,
-                                  timeout=self.wait_seconds + 60.0) as c:
+                                  timeout=self.wait_seconds + 60.0, event_hooks=request_id_hooks()) as c:
                     r = c.post(self._url(ENSURE_PATH), json=self._request(reason))
                 return self._took(r.json() if r.content else {})
             except (httpx.HTTPError, ValueError) as e:
@@ -126,7 +129,8 @@ class OnDemand:
 
     def release_sync(self, reason: str = "done") -> bool:
         try:
-            with httpx.Client(transport=self._sync_transport, headers=self._headers, timeout=60.0) as c:
+            with httpx.Client(transport=self._sync_transport, headers=self._headers, timeout=60.0,
+                              event_hooks=request_id_hooks()) as c:
                 r = c.post(self._url(RELEASE_PATH), json=ReleaseRequest(holder=self.holder, reason=reason).to_dict())
             self._renewed_at = None
             return r.is_success

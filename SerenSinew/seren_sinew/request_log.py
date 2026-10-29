@@ -26,8 +26,15 @@ THE REQUEST ID
   logs by one string); otherwise a short random one is minted. Either way it
   is on the log line and echoed back on the response as ``X-Request-Id``, so
   a person looking at a bad reply in the browser can grep for exactly that
-  request. Cheap now, and every leaf will want it the day the cluster client
-  lands.
+  request.
+
+  CARRYING IT TO THE NEXT HOP. Minting it was half the job: until 25 Oct 2026
+  no service sent it on, so every hop started a new id and a call could not
+  be followed from one log into the next. The middleware now binds the id
+  for the life of the request (current_request_id()), and an httpx client
+  built with request_id_hooks() puts it on every call it makes. Work that no
+  request started - a sleep on the tick, a loop - binds one of its own with
+  request_id_scope(), so all the calls one sleep makes share one id too.
 
 WHY A FILE THE USER OWNS
   'sudo journalctl -u seren-*' wants a password every time. Anyone debugging
@@ -71,8 +78,10 @@ import os
 import secrets
 import time
 import traceback
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -82,6 +91,47 @@ REQUEST_ID_HEADER = "X-Request-Id"
 #: Longest inbound id we will carry. Anything past this is not an id, it is
 #: somebody's payload trying to land in a log file.
 _MAX_REQUEST_ID = 64
+
+_current: ContextVar[Optional[str]] = ContextVar("seren_request_id", default=None)
+
+
+def current_request_id() -> Optional[str]:
+    """The id of the request (or scope) this code is running for, or None."""
+    return _current.get()
+
+
+@contextmanager
+def request_id_scope(rid: Optional[str] = None, *, prefix: str = "") -> Iterator[str]:
+    """Bind an id for work no request started (a sleep on the tick, a loop),
+    so every call it makes carries the same one. With no rid, an id already
+    bound is kept - a sleep started by POST /sleep stays that request's - and
+    one is minted (prefix + hex) only when there is none."""
+    rid = _request_id(rid) if rid else (_current.get() or f"{prefix}{secrets.token_hex(6)}")
+    token = _current.set(rid)
+    try:
+        yield rid
+    finally:
+        _current.reset(token)
+
+
+def forward_request_id(request: Any) -> None:
+    """httpx request hook: put the bound id on the outbound request, unless the
+    caller set one itself. A no-op with nothing bound - the next hop mints."""
+    rid = _current.get()
+    if rid and REQUEST_ID_HEADER not in request.headers:
+        request.headers[REQUEST_ID_HEADER] = rid
+
+
+async def aforward_request_id(request: Any) -> None:
+    """forward_request_id for an httpx.AsyncClient, whose hooks must be async."""
+    forward_request_id(request)
+
+
+def request_id_hooks(*, asynchronous: bool = False) -> dict[str, list]:
+    """event_hooks for an httpx client that carries the request id:
+    ``httpx.Client(..., event_hooks=request_id_hooks())``, or
+    ``request_id_hooks(asynchronous=True)`` for an AsyncClient."""
+    return {"request": [aforward_request_id if asynchronous else forward_request_id]}
 
 
 def _default_log_filename(service_name: str) -> str:
@@ -222,8 +272,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             path = f"{path}?{request.url.query}"
         client = request.client.host if request.client else "?"
         rid = _request_id(request.headers.get(REQUEST_ID_HEADER))
-        # Routes that want it (to pass along to the next hop) read it here.
+        # Routes that want it read it here; clients built with
+        # request_id_hooks() pick it up from the binding on their own.
         request.state.request_id = rid
+        bound = _current.set(rid)
 
         try:
             response = await call_next(request)
@@ -253,3 +305,5 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 f"  {type(e).__name__}: {e}\n{tb}"
             )
             raise
+        finally:
+            _current.reset(bound)

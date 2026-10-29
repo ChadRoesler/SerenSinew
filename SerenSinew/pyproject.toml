@@ -47,7 +47,7 @@ Repository = "https://github.com/ChadRoesler/SerenSinew"
 "Bug Tracker" = "https://github.com/ChadRoesler/SerenSinew/issues"
 
 [tool.setuptools]
-packages = ["seren_sinew"]
+packages = ["seren_sinew", "seren_sinew.cluster"]
 
 [tool.setuptools_scm]
 # Inner project dir under the git root, mirroring the rest of the family

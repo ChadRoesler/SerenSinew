@@ -21,8 +21,13 @@ and says so, rather than refusing to start.
 **Request ids.** Every request gets one: an inbound `X-Request-Id` is kept, so
 one string follows a call from Lodestar through Observatory into a service;
 otherwise a short random one is minted. It is on the log line and echoed back
-as `X-Request-Id` on the response, and routes can read it from
-`request.state.request_id` to pass along to the next hop.
+as `X-Request-Id` on the response, and it goes on to the next hop by itself:
+a client built with `request_id_hooks()` carries it, and work no request
+started (a sleep on the tick) binds its own with `request_id_scope()`.
+
+**Small files written whole** (`seren_sinew.atomic`). `write_json`,
+`write_text`, `write_bytes`: a temp file beside the target, fsynced and
+swapped in, so a crash leaves the last good file or the new one.
 
 It's parameterized, not hardcoded - `service_name` picks the logger name and
 log filename, `env_prefix` picks the env-var namespace:

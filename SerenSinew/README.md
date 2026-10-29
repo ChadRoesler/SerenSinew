@@ -21,8 +21,22 @@ and says so, rather than refusing to start.
 **Request ids.** Every request gets one: an inbound `X-Request-Id` is kept, so
 one string follows a call from Lodestar through Observatory into a service;
 otherwise a short random one is minted. It is on the log line and echoed back
-as `X-Request-Id` on the response, and routes can read it from
-`request.state.request_id` to pass along to the next hop.
+as `X-Request-Id` on the response, and it is bound for the life of the
+request, so it goes on to the next hop by itself: a client built with
+`request_id_hooks()` puts it on every call it makes. Work no request started
+(a sleep on the tick, a loop) binds one of its own with `request_id_scope()`,
+and every call inside shares it.
+
+```python
+import httpx
+from seren_sinew.request_log import request_id_hooks, request_id_scope
+
+memory = httpx.Client(base_url=memory_url, event_hooks=request_id_hooks())
+memory_async = httpx.AsyncClient(base_url=memory_url, event_hooks=request_id_hooks(asynchronous=True))
+
+with request_id_scope(prefix="sleep-"):    # keeps a request's id if one is bound
+    memory.get("/short/aging")            # X-Request-Id: sleep-1a2b3c4d5e6f
+```
 
 It's parameterized, not hardcoded - `service_name` picks the logger name and
 log filename, `env_prefix` picks the env-var namespace:
@@ -100,11 +114,61 @@ blob = keep.put(png_bytes)          # Blob(digest, bytes, mime, ext, existed)
 stores = [Store("notes", "sqlite", db_path), keep.store("keepsakes", "pictures kept with the notes")]
 ```
 
+**Small files written whole** (`seren_sinew.atomic`). A state file, a ledger
+record, a job's status: written to a temp file beside it (named for the
+writer, so two writers of one folder never share one), fsynced, and swapped
+in, so a crash leaves the last good file or the new one, never half of one.
+A swap Windows refuses because a reader holds the file open is tried again for
+about a second. `mode=0o600` makes a token private from the first byte.
+
+```python
+from seren_sinew.atomic import read_json, write_json, write_text
+
+write_json(state_path, state)                       # indent=2 by default
+write_text(token_path, token, mode=0o600)
+state = read_json(state_path, default={})           # missing or damaged -> default
+```
+
+**The head-to-node wire, spelled once** (`seren_sinew.cluster`). Lodestar
+and each node's Observatory talk over `/api/v1/...`. Until 28 Oct 2026 each
+side spelled the shapes on that wire itself, and they drifted: the Observatory
+renamed `agent_version` to `observatory_version` and the head's `version_async`
+quietly returned None on every node. Now the shapes live here and both sides
+import them.
+
+- `seren_sinew.cluster.dtos` - one dataclass per answer, plus `from_dict`,
+  `to_dict` and `drift`. Standard library only. A FIXED shape (a ping, a
+  health rollup, a lifecycle answer) parsed with `strict=True` raises
+  `WireDrift` naming any key it does not know or required field it lacks; an
+  OPEN shape (a service's manifest, its status, the node's manifest) keeps
+  unknown keys in `extra` so nothing is lost. The default is lenient, as the
+  head always was: a missing required field becomes its empty value.
+- `seren_sinew.cluster.client` - `NodeClient`, the typed client for one
+  Observatory (needs httpx: the `client` extra).
+- `seren_sinew.cluster.discovery` - `ClusterClient` (one NodeClient per
+  node, routing by capability, suspicion with a backoff) and
+  `DiscoveryService` (the periodic refresh).
+
+The Jetson-era names (`JetsonAgentClient`, `JetsonClusterClient`,
+`JetsonNodeOptions`) remain as aliases; `agent_url` and friends are public
+config keys in every deployed head.
+
+**Contract tests, both sides.** Lodestar's `tests/test_wire_contract.py`
+drives its client into a real in-process Observatory; the Observatory's
+`tests/test_wire_contract.py` parses its own routes' answers strictly with
+these shapes. A key one side adds and the other does not know fails a test
+on whichever side changed, instead of being dropped on the floor.
+
+```python
+from seren_sinew.cluster import HealthResponse, from_dict, drift
+
+h = from_dict(answer, HealthResponse, strict=True)   # WireDrift if the wire moved
+problems = drift(answer, HealthResponse)              # the same, as a list, nothing raised
+```
+
 ## What's coming
 
-The cluster client, discovery and the DTOs that Lodestar and Observatory
-currently spell separately. Sinew is where the connective runtime code goes;
-Meninges stays the membrane.
+Sinew is where the connective runtime code goes; Meninges stays the membrane.
 
 ## Install
 
