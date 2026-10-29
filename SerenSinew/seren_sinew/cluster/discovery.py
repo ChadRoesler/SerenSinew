@@ -49,6 +49,9 @@ class ClusterClient:
         self._log = log_fn or (lambda msg: log.info(f"[cluster] {msg}"))
         # node -> (monotonic deadline, reason). See mark_node_suspect.
         self._suspect: dict[str, tuple[float, str]] = {}
+        # (node, service) -> why routing must not send a request for that
+        # service to that node right now. See hold.
+        self._holds: dict[tuple[str, str], str] = {}
 
         if not options.nodes:
             self._log("no nodes configured - cluster starts empty (zero-config mode)")
@@ -326,8 +329,34 @@ class ClusterClient:
         online = [n for n in self._options.nodes if self._is_online_with(n.name, capability)]
         return sorted(online, key=lambda n: capability not in n.preferred_for)
 
+    # ── holds: a service a node has, that routing must not use right now ──
+
+    def hold(self, node_name: str, service: str, reason: str) -> None:
+        """Take ONE service on ONE node out of routing: the box still answers
+        and the service is still installed, but a request for it goes to the
+        fallback instead. The Transit (28 Oct 2026): while the hippocampus's
+        llama has displaced the main one on a box, 'can use?' for the main
+        one is no, and Symposium's ask goes elsewhere instead of queueing
+        behind a brief. Lifted with unhold; never by time."""
+        if node_name in self._agents:
+            self._holds[(node_name, service)] = reason
+            self._log(f"hold: {node_name}/{service} ({reason})")
+
+    def unhold(self, node_name: str, service: str) -> None:
+        if self._holds.pop((node_name, service), None) is not None:
+            self._log(f"unhold: {node_name}/{service}")
+
+    def hold_reason(self, node_name: str, service: str) -> Optional[str]:
+        return self._holds.get((node_name, service))
+
+    def holds(self) -> dict[str, str]:
+        """{"node/service": reason} for every hold standing."""
+        return {f"{n}/{s}": why for (n, s), why in sorted(self._holds.items())}
+
     def _is_online_with(self, node_name: str, capability: str) -> bool:
         if self.is_suspect(node_name):
+            return False
+        if (node_name, capability) in self._holds:
             return False
         snap = self._snapshots.get(node_name)
         if snap is None:

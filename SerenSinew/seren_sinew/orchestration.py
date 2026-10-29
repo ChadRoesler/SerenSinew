@@ -400,6 +400,14 @@ class RunPolicy:
     mode: str = "unmanaged"
     idle_minutes: float = 0.0
     hours: str = ""
+    #: THE TRANSIT (28 Oct 2026). Apps this one displaces on the same box: an
+    #: ensure of this app on a node where one of them is running first waits
+    #: for that one's holders to let go, then stops it through the node's
+    #: Observatory, then starts this one. For two llamas on one GPU: the
+    #: hippocampus's model displaces the main one for the minutes it drafts.
+    #: Names match an install's full or short name. Nothing is restored after:
+    #: an on_demand sibling comes back on the next ask for it.
+    displaces: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: Optional[dict[str, Any]], fallback: Optional["RunPolicy"] = None) -> "RunPolicy":
@@ -416,7 +424,13 @@ class RunPolicy:
             idle = base.idle_minutes
         else:
             idle = 15.0 if mode in ("on_demand", "scheduled") else 0.0
-        return cls(mode=mode, idle_minutes=idle, hours=str(d.get("hours") or "") if mode == "scheduled" else "")
+        disp = d.get("displaces")
+        if isinstance(disp, str):
+            disp = [disp]
+        displaces = ([str(x).strip() for x in disp if str(x).strip()] if isinstance(disp, (list, tuple))
+                     else list(base.displaces))
+        return cls(mode=mode, idle_minutes=idle, hours=str(d.get("hours") or "") if mode == "scheduled" else "",
+                   displaces=displaces)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -431,6 +445,15 @@ class RunPolicy:
         b = int(m.group(3)) * 60 + int(m.group(4))
         t = when.hour * 60 + when.minute
         return a <= t < b if a <= b else (t >= a or t < b)
+
+
+def displaced_by(policy: RunPolicy, service: str, running: "list[str] | tuple[str, ...] | set[str]") -> list[str]:
+    """The services among `running` (what one node reports up) that `service`
+    displaces under its policy: each matched by full or short name, never
+    itself. Empty when the policy names nothing."""
+    if not policy.displaces:
+        return []
+    return [s for s in running if s != service and any(matches(s, name) for name in policy.displaces)]
 
 
 class Policies:
@@ -510,5 +533,5 @@ def decide(entries: dict[tuple[str, str], dict[str, Any]], running: dict[tuple[s
 
 __all__ = ["ENSURE_PATH", "RELEASE_PATH", "DEFAULT_WAIT_SECONDS", "MAX_WAIT_SECONDS", "DEFAULT_TTL_SECONDS",
            "EnsureRequest", "EnsureResult", "ReleaseRequest", "ReleaseResult", "Leases",
-           "RUN_MODES", "SEREN_APPS", "RunPolicy", "Policies", "Decision", "decide", "short_name", "matches",
-           "resolve"]
+           "RUN_MODES", "SEREN_APPS", "RunPolicy", "Policies", "Decision", "decide", "displaced_by", "short_name",
+           "matches", "resolve"]
