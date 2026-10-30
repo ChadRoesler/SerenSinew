@@ -25,6 +25,8 @@ between them.
     POST /api/v1/carabiner/{carabiner}/settings      SettingsRequest -> SettingsResult
     GET  /api/v1/carabiner/{carabiner}/belay         -> BelayReport
     POST /api/v1/carabiner/{carabiner}/upgrade       UpgradeRequest -> UpgradeResult
+    POST /api/v1/carabiner/{carabiner}/clip          UpgradeRequest -> UpgradeResult (a first file)
+    POST /api/v1/carabiner/{carabiner}/unclip        {"reason"} -> UnclipResult
 
 The Observatory answers for the carabiners on its own box; Lodestar answers
 for the cluster, choosing the Observatory by the request's `node` (`?node=`
@@ -45,6 +47,15 @@ writes the file beside the one it replaces, and has the INSTALLED .kbh run
 `kbh upgrade` as the person: belay before, swap, belay after, the old one put
 back if anything that held lets go. A .kbh from before 5.1.3 has no upgrade
 verb; then the new file runs it (`--into` the old one), once.
+
+CLIP AND UNCLIP (29 Oct 2026). A clip is a carabiner's FIRST file on a box:
+the same message as an upgrade, checked the same way, written as
+<carabiner>.kbh - and nothing of it runs, because there is no installed .kbh
+to belay with and what it registers in its harness (hooks, an MCP server, a
+bookmark) is `kbh <c> register`, the person's, from the settings sheet or by
+hand. An unclip moves the .kbh beside itself as .unclipped-<version>, never
+deletes it, leaves the yaml (the settings are the person's; a re-clip finds
+them), and says plainly that what the carabiner registered is still there.
 """
 from __future__ import annotations
 
@@ -57,6 +68,7 @@ import re
 import secrets
 import tempfile
 import threading
+import time
 import zipfile
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -68,6 +80,8 @@ LIST_PATH = "/api/v1/carabiners"
 SETTINGS_PATH = "/api/v1/carabiner/{carabiner}/settings"
 BELAY_PATH = "/api/v1/carabiner/{carabiner}/belay"
 UPGRADE_PATH = "/api/v1/carabiner/{carabiner}/upgrade"
+CLIP_PATH = "/api/v1/carabiner/{carabiner}/clip"
+UNCLIP_PATH = "/api/v1/carabiner/{carabiner}/unclip"
 
 REQUEST_ENV = "KBH_SETTINGS_REQUEST"
 MAX_REQUEST = 30000            # characters: a Windows environment variable holds 32767
@@ -312,6 +326,37 @@ class UpgradeResult:
         return cls(ok=False, carabiner=carabiner, node=node, error=error)
 
 
+@dataclass
+class UnclipResult:
+    """A carabiner taken off a box. `kept` is where its .kbh went (beside
+    itself, never deleted); `yaml_kept` says its settings file is still
+    there for a re-clip. `note` says what this did NOT do: what the carabiner
+    registered in its harness is still registered."""
+    ok: bool = False
+    carabiner: str = ""
+    node: str = ""
+    was: str = ""                                       # the version that came off
+    kept: str = ""
+    yaml_kept: bool = False
+    reason: str = ""
+    note: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict[str, Any]]) -> "UnclipResult":
+        k = _known(cls, d)
+        return cls(ok=bool(k.get("ok")), carabiner=str(k.get("carabiner") or ""), node=str(k.get("node") or ""),
+                   was=str(k.get("was") or ""), kept=str(k.get("kept") or ""), yaml_kept=bool(k.get("yaml_kept")),
+                   reason=str(k.get("reason") or ""), note=str(k.get("note") or ""), error=str(k.get("error") or ""))
+
+    @classmethod
+    def failed(cls, carabiner: str, error: str, node: str = "") -> "UnclipResult":
+        return cls(ok=False, carabiner=carabiner, node=node, error=error)
+
+
 _VERSION = re.compile(r"""__version__\s*=\s*["']([^"']+)""")
 _BUILD = re.compile(r"""BUILD\s*=\s*["']([^"']*)""")
 
@@ -509,3 +554,83 @@ class KbhRunner:
             except OSError:
                 pass
             self._upgrading.release()
+
+    def clip(self, carabiner: str, req: UpgradeRequest) -> UpgradeResult:
+        """A carabiner's FIRST file on this box: check the hash, put it in the
+        folder as <carabiner>.kbh. Nothing of it runs here - there is no
+        installed .kbh to belay with - and what it registers in its harness is
+        the person's `kbh <c> register`, from the settings sheet or by hand.
+        One that is already here is an upgrade, not a clip."""
+        if not NAME.fullmatch(carabiner or ""):
+            return UpgradeResult.failed(carabiner, f"LookupError: not a carabiner name: {carabiner!r}", self.node)
+        if not self.folder:
+            return UpgradeResult.failed(carabiner, "carabiners have no folder on this box", self.node)
+        kbh = os.path.join(self.folder, f"{carabiner}.kbh")
+        if os.path.exists(kbh):
+            return UpgradeResult.failed(carabiner, f"{carabiner}.kbh is already clipped on this box: "
+                                                   f"an upgrade swaps a new file in", self.node)
+        if not SHA256.fullmatch(req.sha256 or ""):
+            return UpgradeResult.failed(carabiner, "a clip carries the file's sha256; this one did not", self.node)
+        try:
+            data = req.data()
+        except ValueError as e:
+            return UpgradeResult.failed(carabiner, str(e), self.node)
+        got = hashlib.sha256(data).hexdigest()
+        if got != req.sha256:
+            return UpgradeResult.failed(carabiner, f"the file that arrived has sha256 {got}, not {req.sha256}: "
+                                                   f"damaged on the way; nothing was written", self.node)
+        if not self._upgrading.acquire(blocking=False):
+            return UpgradeResult.failed(carabiner, "an upgrade is already running on this box", self.node)
+        incoming = os.path.join(self.folder, f".{carabiner}.kbh.incoming-{secrets.token_hex(4)}")
+        try:
+            os.makedirs(self.folder, exist_ok=True)
+            with open(incoming, "wb") as f:
+                f.write(data)
+            os.chmod(incoming, 0o644)                    # written by the service, read by the person
+            version, _ = kbh_identity(incoming)
+            if not version:
+                os.unlink(incoming)
+                return UpgradeResult.failed(carabiner, "not a .kbh: it carries no kbh/__init__.py with a "
+                                                       "version; nothing was clipped", self.node)
+            os.replace(incoming, kbh)
+            return UpgradeResult(ok=True, carabiner=carabiner, node=self.node, was="", now=version, changed=True,
+                                 sha256=got, sha256_checked=True)
+        except OSError as e:
+            try:
+                os.unlink(incoming)
+            except OSError:
+                pass
+            return UpgradeResult.failed(carabiner, f"{type(e).__name__}: {e}", self.node)
+        finally:
+            self._upgrading.release()
+
+    def unclip(self, carabiner: str, reason: str = "") -> UnclipResult:
+        """Take a carabiner off this box: <carabiner>.kbh moves beside itself
+        as <carabiner>.kbh.unclipped-<version>, never deleted, and its yaml
+        stays - the settings are the person's, and a re-clip finds them. What
+        the carabiner registered in its harness (hooks, an MCP server, a
+        bookmark) is not touched; the answer says so."""
+        try:
+            kbh, yaml = self._paths(carabiner)
+        except LookupError as e:
+            return UnclipResult.failed(carabiner, f"LookupError: {e}", self.node)
+        if not self._upgrading.acquire(blocking=False):
+            return UnclipResult.failed(carabiner, "an upgrade is running on this box; try again when it ends",
+                                       self.node)
+        try:
+            version, _ = kbh_identity(kbh)
+            stamp = re.sub(r"[^A-Za-z0-9._+-]", "_", version or time.strftime("%Y%m%d-%H%M%S"))
+            kept, n = f"{kbh}.unclipped-{stamp}", 1
+            while os.path.exists(kept):
+                n += 1
+                kept = f"{kbh}.unclipped-{stamp}-{n}"
+            os.replace(kbh, kept)
+        except OSError as e:
+            return UnclipResult.failed(carabiner, f"{type(e).__name__}: {e}", self.node)
+        finally:
+            self._upgrading.release()
+        return UnclipResult(ok=True, carabiner=carabiner, node=self.node, was=version, kept=kept,
+                            yaml_kept=os.path.isfile(yaml), reason=(reason or "")[:200],
+                            note=f"{carabiner}.kbh is off the Rack and kept beside itself; its yaml stays for a "
+                                 f"re-clip. What it registered in its harness (hooks, an MCP server, a bookmark) "
+                                 f"is still registered: that is the person's to undo.")
