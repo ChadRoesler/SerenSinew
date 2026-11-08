@@ -75,7 +75,18 @@ class SomaRobot:
         await self._post("react", {"name": name, "ms": ms})
 
     async def leds(self, frame: list[tuple[int, int, int]]) -> None:
+        """Every LED from 0 up, each (r, g, b) 0~168; the robot clamps past that."""
         await self._post("leds", {"frame": [list(c) for c in frame]})
+
+    async def head(self, *, yaw: Optional[int] = None, pitch: Optional[int] = None, speed: int = 150) -> None:
+        """Turns the head: yaw -128 (its right) to 128, pitch 0 (level) to 90, speed 100 to 1000.
+        Either can be left where it is."""
+        body: dict[str, int] = {"speed": speed}
+        if yaw is not None:
+            body["yaw"] = yaw
+        if pitch is not None:
+            body["pitch"] = pitch
+        await self._post("head", body)
 
     async def send_face(self, bundle: bytes) -> None:
         """Hands a packed face over; it goes in on the next boot (reboot() to see it now)."""

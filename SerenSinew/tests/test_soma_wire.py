@@ -110,6 +110,7 @@ def test_robot_client_sends_its_token_and_reads_settings():
         s = await robot.settings(dimmer=40)
         await robot.night(NightCap(10, 20, 30))
         await robot.night(None)
+        await robot.head(yaw=30)
         await robot.aclose()
         return st, s
 
@@ -119,6 +120,7 @@ def test_robot_client_sends_its_token_and_reads_settings():
     assert seen[1][1:] == ("/api/settings", "tok", {"dimmer": 40})
     assert seen[2][3] == {"night": {"dimmer": 10, "volume": 20, "brightness": 30}}
     assert seen[3][3] == {"night": None}
+    assert seen[4][1:] == ("/api/head", "tok", {"speed": 150, "yaw": 30})      # pitch left where it is
 
 
 def test_robot_client_sends_a_face_with_its_crc():
