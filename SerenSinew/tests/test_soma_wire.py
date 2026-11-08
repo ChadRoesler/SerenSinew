@@ -16,7 +16,7 @@ import pytest
 
 from seren_sinew.cluster.dtos import WireDrift, from_dict, to_dict
 from seren_sinew.soma import (
-    MAX_BUNDLE, AppliedSettings, NightCap, NightSettings, RobotSettings, RobotStatus, TouchFeed, TouchSpots,
+    MAX_BUNDLE, AppliedSettings, NightCap, NightSettings, RobotSettings, RobotConfigSource, RobotStatus, TouchFeed, TouchSpots,
     VoiceSettings, crc32_hex, pack, unpack,
 )
 
@@ -27,6 +27,7 @@ STATUS = {
     "rig": "0,0 0,0 0,0 0,0 -1", "resting": "", "facePush": "installed a new face: 88 files", "twitches": 3,
     "settings": {"dimmer": 100, "volume": 70, "brightness": 75, "night": None,
                  "applied": {"dimmer": 100, "volume": 70, "brightness": 75}},
+    "config": {"token": "saved", "voice": "build"},   # firmware 0.2.0 on; older has none
     "batteryLevel": 100, "charging": True, "freeInternalHeap": 44459, "freePsram": 6000000,
     "yaw": 0, "pitch": 0, "face": "studio",
 }
@@ -196,7 +197,8 @@ def test_every_key_the_firmware_sends_is_a_field():
     settings = _function(src, "void add_settings(cJSON* root)")
     fields = lambda dto: {f for f in dto.__dataclass_fields__}  # noqa: E731
     assert _keys(status, "root") <= fields(RobotStatus), _keys(status, "root") - fields(RobotStatus)
-    assert "settings" in _keys(settings, "root")
+    assert _keys(settings, "root") == {"settings", "config"}
+    assert _keys(settings, "c") == fields(RobotConfigSource)
     assert _keys(settings, "s") <= fields(RobotSettings), _keys(settings, "s") - fields(RobotSettings)
     assert _keys(settings, "n") == fields(NightCap)
     assert _keys(settings, "a") == fields(AppliedSettings)
@@ -227,3 +229,125 @@ def test_the_touch_feed_keys_are_fields():
     events = events[:events.index("\n            self.feed = ")]
     for key in re.findall(r'"(\w+)":', events):
         assert key in TouchEvent.__dataclass_fields__, key
+
+
+def test_a_token_source_is_asked_again_on_a_401_and_the_request_retried():
+    httpx = pytest.importorskip("httpx")
+    from seren_sinew.soma.client import SomaRobot, SomaVoice
+    held = {"robot": "old", "voice": "old"}       # what's on disk; the servers only take "new"
+    asked = {"robot": 0, "voice": 0}
+    seen = []
+
+    def source(side):
+        def read():
+            asked[side] += 1
+            return held[side]
+        return read
+
+    def handler(request):
+        tok = request.headers.get("X-StackChan-Token") or request.headers.get("Authorization", "")
+        seen.append((request.url.path, tok, request.content))
+        if tok.endswith("new"):
+            return httpx.Response(200, json=STATUS if request.url.path.endswith("status") else
+                                  {"ok": True, "settings": STATUS["settings"]})
+        return httpx.Response(401, text="bad token")
+
+    async def go():
+        robot = SomaRobot("http://bot:8080", source("robot"), transport=httpx.MockTransport(handler))
+        voice = SomaVoice("http://v:7480", source("voice"), transport=httpx.MockTransport(handler))
+        held["robot"] = "new"                        # rotated under a running client
+        st = await robot.settings(dimmer=40)          # 401 with old, re-read, retried with new
+        again = await robot.status()                  # new from the start now: no second read
+        try:
+            await voice.status()                      # still old on disk: one 401, no loop
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+        await robot.aclose()
+        await voice.aclose()
+        return st, again, code
+
+    st, again, code = _run(go())
+    assert st.dimmer == 100 and again.face == "studio" and code == 401
+    assert asked == {"robot": 2, "voice": 2}         # once at start, once on the 401
+    assert seen[0][1] == "old" and seen[1][1] == "new" and seen[0][2] == seen[1][2]   # same body, resent
+    assert sum(1 for p, t, _ in seen if p == "/status" and "Bearer" in t) == 1        # voice: one try, then the 401
+
+
+def test_a_plain_string_token_is_never_retried():
+    httpx = pytest.importorskip("httpx")
+    from seren_sinew.soma.client import SomaRobot
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(401)
+
+    async def go():
+        robot = SomaRobot("http://bot:8080", "tok", transport=httpx.MockTransport(handler))
+        try:
+            await robot.status()
+        except httpx.HTTPStatusError:
+            pass
+        await robot.aclose()
+    _run(go())
+    assert len(calls) == 1
+
+
+def test_token_file_reads_the_file_each_time(tmp_path):
+    from seren_sinew.soma.client import token_file
+    f = tmp_path / "t"
+    read = token_file(f)
+    assert read() == ""                    # not there yet: no token, not an error
+    f.write_text("one\n")
+    assert read() == "one"
+    f.write_text("two")
+    assert read() == "two"
+
+
+def test_voice_client_sets_a_robot_up_and_fetches_a_card():
+    httpx = pytest.importorskip("httpx")
+    from seren_sinew.soma.client import SomaVoice
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        if request.url.path == "/robot/config":
+            return httpx.Response(200, json={"ok": True, "changed": ["voice", "token"], "rebooting": True,
+                                             "token_rotated": True})
+        return httpx.Response(200, text="voice: \"x\"\ntoken: \"t\"\n")
+
+    async def go():
+        voice = SomaVoice("http://v:7480", "vt", transport=httpx.MockTransport(handler))
+        done = await voice.setup_robot({"voice": "auto"}, rotate_token=True)
+        card = await voice.robot_card({"wifi": {"ssid": "Home", "password": "pw"}})
+        await voice.aclose()
+        return done, card
+
+    done, card = _run(go())
+    assert done["changed"] == ["voice", "token"] and card.startswith("voice:")
+    assert seen[0] == ("/robot/config", {"voice": "auto", "rotate_token": True, "reboot": True})
+    assert seen[1] == ("/robot/soma.yaml", {"wifi": {"ssid": "Home", "password": "pw"}})
+
+
+def test_voice_client_firmware_calls():
+    httpx = pytest.importorskip("httpx")
+    from seren_sinew.soma.client import SomaVoice
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, dict(request.url.params), request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    async def go():
+        voice = SomaVoice("http://v:7480", "vt", transport=httpx.MockTransport(handler))
+        await voice.firmware()
+        await voice.fetch_firmware()
+        await voice.upload_firmware("0.2.0-mine", b"\xe9image")
+        await voice.install_firmware("0.2.0-mine")
+        await voice.aclose()
+    _run(go())
+    assert [s[:2] for s in seen] == [("GET", "/firmware"), ("POST", "/firmware/fetch"),
+                                     ("PUT", "/firmware/upload"), ("POST", "/firmware/install")]
+    assert seen[1][3] == b'{"version":"latest"}' or json.loads(seen[1][3]) == {"version": "latest"}
+    assert seen[2][2] == {"version": "0.2.0-mine"} and seen[2][3] == b"\xe9image"
+    assert json.loads(seen[3][3]) == {"version": "0.2.0-mine", "reboot": True}

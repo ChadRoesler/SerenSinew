@@ -54,6 +54,14 @@ class RobotSettings:
 
 
 @dataclass
+class RobotConfigSource:
+    """Where the robot's per-body settings came from: "saved" (soma.yaml or /api/config),
+    "build", or for the token "none" (open on the LAN). Never the values."""
+    token: str = ""
+    voice: str = ""
+
+
+@dataclass
 class RobotStatus:
     """GET /api/status. Most keys are there only when they mean something: ``rig``
     and ``resting`` with a sprite face, ``facePush`` after a face was sent."""
@@ -67,6 +75,7 @@ class RobotStatus:
     facePush: Optional[str] = None
     twitches: Optional[int] = None
     settings: Optional[RobotSettings] = None
+    config: Optional[RobotConfigSource] = None   # firmware 0.2.0 on
     batteryLevel: int = 0
     charging: bool = False
     freeInternalHeap: int = 0
@@ -121,11 +130,15 @@ class WorkHours:
 @dataclass
 class OverwhelmSettings:
     """How long unbroken scratching takes to tip the face over, how long a pause
-    breaks it, and how long it rests after."""
-    enabled: bool = True
+    breaks it, and how long it rests after. pose, after and clip name the face's
+    poses and a saved clip (blank: skipped); off until they're set (seren-soma 1.1)."""
+    enabled: bool = False
     seconds: int = 15
     gap_seconds: int = 3
     rest_seconds: int = 120
+    pose: str = ""
+    after: str = ""
+    clip: str = ""
 
 
 @dataclass

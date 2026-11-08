@@ -33,6 +33,7 @@ from .dtos import (  # noqa: F401
     NightSettings,
     OverwhelmSettings,
     OverwhelmState,
+    RobotConfigSource,
     RobotSettings,
     RobotStatus,
     TouchEvent,
@@ -45,6 +46,6 @@ from .dtos import (  # noqa: F401
 
 __all__ = [
     "AppliedSettings", "HeadTouch", "MAX_BUNDLE", "NightCap", "NightSettings", "OverwhelmSettings",
-    "OverwhelmState", "RobotSettings", "RobotStatus", "TouchEvent", "TouchFeed", "TouchSpots",
+    "OverwhelmState", "RobotConfigSource", "RobotSettings", "RobotStatus", "TouchEvent", "TouchFeed", "TouchSpots",
     "VoiceSettings", "VoiceStatus", "WorkHours", "crc32_hex", "pack", "unpack",
 ]
