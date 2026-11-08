@@ -172,7 +172,7 @@ def test_voice_client_bearer_and_settings():
 
 SOMA = Path(__file__).resolve().parents[3] / "SerenSoma"
 FIRMWARE = SOMA / "firmware" / "main" / "hal" / "hal_control_server.cpp"
-VOICE = SOMA / "seren-voice" / "seren_voice.py"
+VOICE = SOMA / "SerenSoma" / "seren_soma" / "voice.py"
 
 
 def _function(source: str, signature: str) -> str:
