@@ -52,6 +52,24 @@ Knobs (per `env_prefix`):
 | `<PREFIX>_LOG_LEVEL` | `INFO` (default) `\| DEBUG \| WARNING \| ERROR` |
 | `<PREFIX>_LOG_QUERY` | `1` to append `?query` to the logged path (off by default - query strings can carry tokens / PII) |
 
+**The wire to a body** (`seren_sinew.soma`). SerenSoma is a Stack-chan robot
+with Seren inside: its firmware's control API and the voice server that is its
+nervous system. SerenPsycheion watches it and makes its faces. What passes
+between them is spelled here once:
+
+- `dtos`: the robot's status and settings (a master light dimmer, speaker
+  volume, screen brightness, a night cap), its touch spots and head touches,
+  and the voice server's settings (night hours, work hours, overwhelm) and
+  live touch feed. Standard library only.
+- `bundle`: a face packed the way the robot unpacks it, and its CRC.
+- `client`: `SomaRobot` and `SomaVoice`, async, over httpx (the `client`
+  extra).
+
+There is deliberately no camera call: a photo is taken only when the person
+in the room says so. The firmware is C++, so its side is pinned by a contract
+test that reads the firmware's own source for the keys it sends, whenever a
+SerenSoma checkout sits beside this one.
+
 ## What's coming
 
 The cluster client, discovery and the DTOs that Lodestar and Observatory
