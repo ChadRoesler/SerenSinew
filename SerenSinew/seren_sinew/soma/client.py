@@ -1,6 +1,6 @@
 """Typed clients for a Seren body. Needs httpx (the ``client`` extra).
 
-    robot = SomaRobot("http://192.168.1.50:8080", token)      # the firmware
+    robot = SomaRobot("http://192.0.2.21:8080", token)      # the firmware
     voice = SomaVoice("http://127.0.0.1:7480", token)         # the voice server
 
 Both are async. The tokens are the person's own (the robot's control token and
