@@ -142,11 +142,19 @@ class OverwhelmSettings:
 
 
 @dataclass
+class ChannelSettings:
+    """The voice channel: how long it waits with no words before it hangs up (10 to 600 s).
+    Live: the next silence uses it (seren-soma 1.2)."""
+    dead_air_seconds: int = 60
+
+
+@dataclass
 class VoiceSettings:
     """GET /settings (POST takes any part of it and answers the whole)."""
     night: NightSettings = field(default_factory=NightSettings)
     work_hours: WorkHours = field(default_factory=WorkHours)
     overwhelm: OverwhelmSettings = field(default_factory=OverwhelmSettings)
+    channel: ChannelSettings = field(default_factory=ChannelSettings)
     night_now: Optional[bool] = None   # GET only: whether the cap is on right now
 
 

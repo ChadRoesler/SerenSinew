@@ -28,6 +28,7 @@ from __future__ import annotations
 from .bundle import MAX_BUNDLE, crc32_hex, pack, unpack  # noqa: F401
 from .dtos import (  # noqa: F401
     AppliedSettings,
+    ChannelSettings,
     HeadTouch,
     NightCap,
     NightSettings,
@@ -45,7 +46,7 @@ from .dtos import (  # noqa: F401
 )
 
 __all__ = [
-    "AppliedSettings", "HeadTouch", "MAX_BUNDLE", "NightCap", "NightSettings", "OverwhelmSettings",
+    "AppliedSettings", "ChannelSettings", "HeadTouch", "MAX_BUNDLE", "NightCap", "NightSettings", "OverwhelmSettings",
     "OverwhelmState", "RobotConfigSource", "RobotSettings", "RobotStatus", "TouchEvent", "TouchFeed", "TouchSpots",
     "VoiceSettings", "VoiceStatus", "WorkHours", "crc32_hex", "pack", "unpack",
 ]
