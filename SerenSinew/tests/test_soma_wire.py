@@ -34,11 +34,11 @@ STATUS = {
 FEED = {
     "events": [
         {"seq": 1, "t": 1762560000.5, "t_ms": 400755, "ms": 450, "kind": "stroke", "way": "front_to_back",
-         "showed": "loving", "overwhelmed": False},
+         "showed": "loving", "scratching": False},
         {"seq": 2, "t": 1762560001.0, "t_ms": 401200, "ms": 0, "kind": "touch_spot", "index": 0, "spot": "boop",
-         "showed": None, "overwhelmed": False},
+         "showed": None},
     ],
-    "last": 2, "overwhelm": {"running": True, "progress": 0.42},
+    "last": 2, "hand": {"down": True, "from_ms": 400755, "to_ms": 419723},
 }
 
 
@@ -62,15 +62,15 @@ def test_settings_with_a_night_cap():
 
 
 def test_touch_spots_with_and_without_head():
-    t = from_dict({"spots": ["boop"], "head": {"scritch": {"pose": "melty", "ms": 4000}}}, TouchSpots, strict=True)
-    assert t.head["scritch"].pose == "melty"
+    t = from_dict({"spots": ["boop"], "head": {"scritch": {"pose": "laughing", "ms": 4000}}}, TouchSpots, strict=True)
+    assert t.head["scritch"].pose == "laughing"
     assert from_dict({"spots": [], "head": None}, TouchSpots, strict=True).head is None
 
 
 def test_touch_feed_keeps_what_a_kind_adds():
     f = from_dict(FEED, TouchFeed, strict=True)
     assert f.events[0].way == "front_to_back" and f.events[0].showed == "loving"
-    assert f.events[1].spot == "boop" and f.overwhelm.progress == 0.42
+    assert f.events[1].spot == "boop" and f.hand.down and f.hand.to_ms == 419723
     novel = from_dict({**FEED["events"][0], "pressure": 3}, type(f.events[0]))
     assert novel.extra == {"pressure": 3}
 
@@ -223,7 +223,7 @@ def test_the_touch_feed_keys_are_fields():
     src = VOICE.read_text(encoding="utf-8")
     feed = src[src.index("async def touch_feed"):src.index("async def status")]
     from seren_sinew.soma import TouchEvent
-    for key in ("events", "last", "overwhelm"):
+    for key in ("events", "last", "hand"):
         assert f'"{key}"' in feed, key
     events = src[src.index("self.feed.append("):]
     events = events[:events.index("\n            self.feed = ")]
@@ -351,3 +351,38 @@ def test_voice_client_firmware_calls():
     assert seen[1][3] == b'{"version":"latest"}' or json.loads(seen[1][3]) == {"version": "latest"}
     assert seen[2][2] == {"version": "0.2.0-mine"} and seen[2][3] == b"\xe9image"
     assert json.loads(seen[3][3]) == {"version": "0.2.0-mine", "reboot": True}
+
+
+def test_touch_spots_carry_the_faces_sounds_and_buildups():
+    t = from_dict({"spots": [], "head": None, "sounds": ["gasp"],
+                   "buildups": {"tip": {"touch": "scratching", "seconds": 15, "gap": 3, "rest": 120, "pose": "surprised",
+                                        "holdMs": 4000, "after": "relaxed", "afterMs": 5000, "flash": [168, 0, 111],
+                                        "sound": "gasp"}}}, TouchSpots, strict=True)
+    assert t.sounds == ["gasp"] and t.buildups["tip"].pose == "surprised" and t.buildups["tip"].flash == [168, 0, 111]
+    old = from_dict({"spots": ["boop"]}, TouchSpots, strict=True)        # firmware before 0.6
+    assert old.sounds == [] and old.buildups is None
+
+
+@pytest.mark.skipif(not FIRMWARE.exists(), reason="no SerenSoma checkout beside this one")
+def test_every_key_touch_spots_sends_is_a_field():
+    src = FIRMWARE.read_text(encoding="utf-8")
+    spots = _function(src, "esp_err_t handle_touch_spots(httpd_req_t* req)")
+    assert _keys(spots, "root") <= set(TouchSpots.__dataclass_fields__), _keys(spots, "root") - set(TouchSpots.__dataclass_fields__)
+    assert {"spots", "sounds", "buildups"} <= _keys(spots, "root")
+
+
+def test_robot_client_plays_a_sound():
+    httpx = pytest.importorskip("httpx")
+    from seren_sinew.soma.client import SomaRobot
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"ok": True, "bytes": 1285})
+
+    async def go():
+        robot = SomaRobot("http://bot:8080", "tok", transport=httpx.MockTransport(handler))
+        await robot.sound("gasp")
+        await robot.aclose()
+    _run(go())
+    assert seen == [("/api/sound", {"name": "gasp"})]

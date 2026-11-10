@@ -98,11 +98,31 @@ class HeadTouch:
 
 
 @dataclass
+class Buildup:
+    """One of a face's build-ups (face.yaml buildups:, firmware 0.6 on): a touch kept up for `seconds`,
+    with no pause longer than `gap`, tips the face into `pose` for `holdMs` (the rails flash `flash`
+    and the face plays `sound` with it), then `after` for `afterMs`, then back; then it rests `rest`
+    seconds. touch: "scratching" or a head touch kind. The robot carries these; SerenPsycheion runs them."""
+    touch: str = "scratching"
+    seconds: float = 15.0
+    gap: float = 3.0
+    rest: float = 120.0
+    pose: str = ""
+    holdMs: int = 4000
+    after: Optional[str] = None
+    afterMs: Optional[int] = None
+    flash: Optional[list[int]] = None   # (r, g, b), 0~168
+    sound: Optional[str] = None
+
+
+@dataclass
 class TouchSpots:
-    """GET /api/touch-spots: the face's screen spots by name, and its head touches
-    (None when the face says nothing about them)."""
+    """GET /api/touch-spots: the face's screen spots by name, its head touches (None when the face
+    says nothing about them), its own sounds and its build-ups (firmware 0.6 on)."""
     spots: list[str] = field(default_factory=list)
     head: Optional[dict[str, HeadTouch]] = None
+    sounds: list[str] = field(default_factory=list)
+    buildups: Optional[dict[str, Buildup]] = None
 
 
 # ── the voice server ───────────────────────────────────────────────────────
@@ -128,20 +148,6 @@ class WorkHours:
 
 
 @dataclass
-class OverwhelmSettings:
-    """How long unbroken scratching takes to tip the face over, how long a pause
-    breaks it, and how long it rests after. pose, after and clip name the face's
-    poses and a saved clip (blank: skipped); off until they're set (seren-soma 1.1)."""
-    enabled: bool = False
-    seconds: int = 15
-    gap_seconds: int = 3
-    rest_seconds: int = 120
-    pose: str = ""
-    after: str = ""
-    clip: str = ""
-
-
-@dataclass
 class ChannelSettings:
     """The voice channel: how long it waits with no words before it hangs up (10 to 600 s).
     Live: the next silence uses it (seren-soma 1.2)."""
@@ -153,15 +159,17 @@ class VoiceSettings:
     """GET /settings (POST takes any part of it and answers the whole)."""
     night: NightSettings = field(default_factory=NightSettings)
     work_hours: WorkHours = field(default_factory=WorkHours)
-    overwhelm: OverwhelmSettings = field(default_factory=OverwhelmSettings)
     channel: ChannelSettings = field(default_factory=ChannelSettings)
     night_now: Optional[bool] = None   # GET only: whether the cap is on right now
 
 
 @dataclass
-class OverwhelmState:
-    running: bool = False
-    progress: float = 0.0              # 0..1 toward tipping over
+class HandState:
+    """The head touch the hand hasn't lifted from yet, on the robot's clock (seren-soma 1.2). What lets a
+    build-up keep counting through one long, unbroken scratch."""
+    down: bool = False
+    from_ms: Optional[int] = None
+    to_ms: Optional[int] = None
 
 
 @dataclass
@@ -179,7 +187,7 @@ class TouchEvent:
     spot: Optional[str] = None
     index: Optional[int] = None
     showed: Optional[str] = None       # the pose it brought up, if any
-    overwhelmed: bool = False
+    scratching: Optional[bool] = None  # head touches: part of scratching, the touch or its burst (seren-soma 1.2)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -188,7 +196,7 @@ class TouchFeed:
     """GET /touch?after=<seq>"""
     events: list[TouchEvent] = field(default_factory=list)
     last: int = 0
-    overwhelm: OverwhelmState = field(default_factory=OverwhelmState)
+    hand: HandState = field(default_factory=HandState)
 
 
 @dataclass

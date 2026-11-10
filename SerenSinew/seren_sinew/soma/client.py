@@ -138,6 +138,15 @@ class SomaRobot:
                                     headers={"X-Face-Crc32": crc32_hex(bundle), "Content-Type": "application/octet-stream"})
         r.raise_for_status()
 
+    async def twitch(self, spec: Optional[dict[str, Any]]) -> None:
+        """Tries a pose's twitch (Face Studio: {"lid", "every", "ms", ...}), or stops one with None."""
+        await self._post("twitch", spec if spec else {"off": True})
+
+    async def sound(self, name: str) -> None:
+        """Plays one of the face's own sounds on the robot (firmware 0.6 on). 404: the face has none by
+        that name; 409: one's already playing, or it's speaking."""
+        await self._post("sound", {"name": name})
+
     async def restore_face(self) -> None:
         """Swaps the face on the card with the one before it, on the next boot."""
         await self._post("face-restore")
@@ -147,7 +156,7 @@ class SomaRobot:
 
 
 class SomaVoice:
-    """The voice server: night, work hours, overwhelm, the touch feed, and the mouth."""
+    """The voice server: night, work hours, the dead-air timer, the touch feed, and the mouth."""
 
     def __init__(self, base_url: str, token: TokenSource, *, timeout: float = 10.0,
                  transport: Optional[httpx.AsyncBaseTransport] = None):
