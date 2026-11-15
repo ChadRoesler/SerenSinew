@@ -23,7 +23,8 @@ import httpx
 
 from ..cluster.dtos import from_dict, to_dict
 from .bundle import crc32_hex
-from .dtos import NightCap, RobotSettings, RobotStatus, TouchFeed, TouchSpots, VoiceSettings, VoiceStatus
+from .dtos import (Heard, NightCap, RobotSettings, RobotStatus, TalkState, TouchFeed, TouchSpots, VoiceSettings,
+                   VoiceStatus)
 
 
 TokenSource = Union[str, Callable[[], str]]
@@ -187,6 +188,27 @@ class SomaVoice:
         r = await self._client.get("touch", params={"after": after})
         r.raise_for_status()
         return from_dict(r.json(), TouchFeed)
+
+    async def heard(self, after: float = 0.0, wait: float = 0.0) -> Heard:
+        """What the robot's microphone heard after time `after` (an entry's own t). wait: hold an empty
+        answer open up to that many seconds (the server stops at 30). after=0 answers at once with what
+        was heard since the voice server started."""
+        r = await self._client.get("heard", params={"after": repr(float(after)), "wait": repr(float(wait))},
+                                   timeout=float(wait) + 15.0)
+        r.raise_for_status()
+        return from_dict(r.json(), Heard)
+
+    async def talk(self) -> TalkState:
+        r = await self._client.get("talk")
+        r.raise_for_status()
+        return from_dict(r.json(), TalkState)
+
+    async def set_talk(self, *, minutes: Optional[float] = None) -> TalkState:
+        """minutes: turn back and forth on for that long (again, to extend it). None: turn it off, which
+        closes the microphone at once. A length the server won't take is a 400 with the reason in its text."""
+        r = await self._client.post("talk", json={"on": False} if minutes is None else {"minutes": minutes})
+        r.raise_for_status()
+        return from_dict(r.json(), TalkState)
 
     async def say(self, text: str, *, emotion: Optional[str] = None, wake: bool = False) -> float:
         """Speaks it through the robot; seconds of audio. wake: open the channel to do it."""

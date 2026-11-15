@@ -557,7 +557,7 @@ class NodeClient:
         except Exception as ex:  # noqa: BLE001 - a node that cannot be reached is an answer, not a crash
             return 0, {"error": f"{self._node_name}: {type(ex).__name__}: {ex}"}
 
-    async def speak_async(self, text: str, voice: str = "wren",
+    async def speak_async(self, text: str, voice: str = "",
                           timeout: float = 180.0) -> tuple[int, Any, dict[str, str]]:
         """The node's speaker (/api/v1/service/speaker/speak): the words and
         the voice, (status, WAV bytes, headers) back - or (status, JSON, {})

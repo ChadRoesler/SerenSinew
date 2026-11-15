@@ -24,7 +24,8 @@ from seren_sinew.soma import (
 STATUS = {
     "ok": True, "firmware": "1.6.2", "uptimeMs": 444000, "resetReason": "software",
     "leds": "000000000000431530431530431530431530000000000000431530431530431530431530",
-    "rig": "0,0 0,0 0,0 0,0 -1", "resting": "", "facePush": "installed a new face: 88 files", "twitches": 3,
+    "rig": "0,0 0,0 0,0 0,0 -1", "resting": "", "held": "",   # held: firmware of 12 Nov 2026 on
+    "facePush": "installed a new face: 88 files", "twitches": 3,
     "settings": {"dimmer": 100, "volume": 70, "brightness": 75, "night": None,
                  "applied": {"dimmer": 100, "volume": 70, "brightness": 75}},
     "config": {"token": "saved", "voice": "build"},   # firmware 0.2.0 on; older has none
@@ -386,3 +387,50 @@ def test_robot_client_plays_a_sound():
         await robot.aclose()
     _run(go())
     assert seen == [("/api/sound", {"name": "gasp"})]
+
+
+# ── hearing, and back and forth (seren-soma 1.4) ────────────────────────────
+
+def test_voice_client_hears_and_runs_back_and_forth():
+    httpx = pytest.importorskip("httpx")
+    from seren_sinew.soma import Heard, TalkState
+    from seren_sinew.soma.client import SomaVoice
+    seen = []
+
+    def handler(request):
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, dict(request.url.params), body))
+        if request.url.path == "/heard":
+            return httpx.Response(200, json={"entries": [{"t": 1794549131.44, "seconds": 2.3, "text": "you call that a combo"}],
+                                             "last": 1794549131.44, "now": 1794549133.0})
+        return httpx.Response(200, json={"on": body is not None and "minutes" in body, "until": 1794550000.0, "voice": "held",
+                                         "channel_open": True, "listening": True, "minutes_range": [1, 180]})
+
+    async def go():
+        voice = SomaVoice("http://v:7480", "vt", transport=httpx.MockTransport(handler))
+        heard = await voice.heard(after=1794549000.5, wait=20)
+        on = await voice.set_talk(minutes=30)
+        off = await voice.set_talk()
+        state = await voice.talk()
+        await voice.aclose()
+        return heard, on, off, state
+
+    heard, on, off, state = _run(go())
+    assert isinstance(heard, Heard) and heard.entries[0].text == "you call that a combo" and heard.last == 1794549131.44
+    assert isinstance(on, TalkState) and on.on is True and off.on is False and state.voice == "held"
+    assert seen[0] == ("GET", "/heard", {"after": "1794549000.5", "wait": "20.0"}, None)
+    assert seen[1][3] == {"minutes": 30} and seen[2][3] == {"on": False} and seen[3][:2] == ("GET", "/talk")
+
+
+@pytest.mark.skipif(not VOICE.exists(), reason="no SerenSoma checkout beside this one")
+def test_what_the_voice_server_sends_for_heard_and_talk_are_fields():
+    from seren_sinew.soma import Heard, HeardLine, TalkState
+    src = VOICE.read_text(encoding="utf-8")
+    heard = src[src.index("async def heard_route"):src.index("async def voice_timing")]
+    answer = heard[heard.index("return web.json_response("):]
+    assert set(re.findall(r'"(\w+)":', answer)) == set(Heard.__dataclass_fields__)
+    line = src[src.index("self.heard_recent = (self.heard_recent + [{"):]
+    line = line[:line.index("}")]
+    assert set(re.findall(r'"(\w+)":', line)) == set(HeardLine.__dataclass_fields__)
+    talk = src[src.index("def talk_state"):src.index("async def talk_get")]
+    assert set(re.findall(r'"(\w+)":', talk)) == set(TalkState.__dataclass_fields__)

@@ -72,6 +72,7 @@ class RobotStatus:
     leds: str = ""              # rrggbb per LED from 0, as shown (after the dimmer)
     rig: Optional[str] = None   # "irisL x,y irisR x,y browL y,tilt browR y,tilt mouth"
     resting: Optional[str] = None
+    held: Optional[str] = None  # the pose held until let go ("hold" on /api/emotion), "" for none; firmware of 12 Nov 2026 on
     facePush: Optional[str] = None
     twitches: Optional[int] = None
     settings: Optional[RobotSettings] = None
@@ -152,6 +153,9 @@ class ChannelSettings:
     """The voice channel: how long it waits with no words before it hangs up (10 to 600 s).
     Live: the next silence uses it (seren-soma 1.2)."""
     dead_air_seconds: int = 60
+    # How much quiet after talking counts as "finished" (300 to 2500 ms). Every turn waits this long
+    # before it can be answered. Live: the next thing said uses it (seren-soma 1.4).
+    end_silence_ms: int = 900
 
 
 @dataclass
@@ -197,6 +201,35 @@ class TouchFeed:
     events: list[TouchEvent] = field(default_factory=list)
     last: int = 0
     hand: HandState = field(default_factory=HandState)
+
+
+@dataclass
+class HeardLine:
+    """One thing the robot's microphone heard, transcribed."""
+    t: float = 0.0                     # when it was heard, unix seconds: what `after` takes
+    seconds: float = 0.0               # how long the talking was
+    text: str = ""
+
+
+@dataclass
+class Heard:
+    """GET /heard?after=<t>&wait=<seconds> (seren-soma 1.4). With wait, an empty answer is held open
+    until something is heard or the wait runs out, so words arrive the moment they are transcribed."""
+    entries: list[HeardLine] = field(default_factory=list)
+    last: float = 0.0                  # the newest entry's t, or the `after` that was asked when there is none
+    now: float = 0.0                   # the voice server's clock, to tell how old an entry is
+
+
+@dataclass
+class TalkState:
+    """GET /talk, and what POST /talk answers (seren-soma 1.4). Back and forth: for a while the robot
+    keeps listening without a tap and the voice stays loaded."""
+    on: bool = False
+    until: Optional[float] = None      # unix seconds it ends by itself; None when off
+    voice: str = ""                    # "held" when the voice is loaded and kept, else why it isn't
+    channel_open: bool = False
+    listening: bool = False
+    minutes_range: list[int] = field(default_factory=list)
 
 
 @dataclass

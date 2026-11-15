@@ -32,11 +32,14 @@ from .dtos import (  # noqa: F401
     ChannelSettings,
     HandState,
     HeadTouch,
+    Heard,
+    HeardLine,
     NightCap,
     NightSettings,
     RobotConfigSource,
     RobotSettings,
     RobotStatus,
+    TalkState,
     TouchEvent,
     TouchFeed,
     TouchSpots,
@@ -46,7 +49,8 @@ from .dtos import (  # noqa: F401
 )
 
 __all__ = [
-    "AppliedSettings", "Buildup", "ChannelSettings", "HandState", "HeadTouch", "MAX_BUNDLE", "NightCap", "NightSettings",
-    "RobotConfigSource", "RobotSettings", "RobotStatus", "TouchEvent", "TouchFeed", "TouchSpots",
+    "AppliedSettings", "Buildup", "ChannelSettings", "HandState", "HeadTouch", "Heard", "HeardLine", "MAX_BUNDLE",
+    "NightCap", "NightSettings", "RobotConfigSource", "RobotSettings", "RobotStatus", "TalkState", "TouchEvent",
+    "TouchFeed", "TouchSpots",
     "VoiceSettings", "VoiceStatus", "WorkHours", "crc32_hex", "pack", "unpack",
 ]
