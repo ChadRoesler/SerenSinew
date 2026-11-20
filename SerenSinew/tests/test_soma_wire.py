@@ -12,12 +12,13 @@ import json
 import re
 from pathlib import Path
 
+import httpx
 import pytest
 
 from seren_sinew.cluster.dtos import WireDrift, from_dict, to_dict
 from seren_sinew.soma import (
-    MAX_BUNDLE, AppliedSettings, NightCap, NightSettings, RobotSettings, RobotConfigSource, RobotStatus, TouchFeed, TouchSpots,
-    VoiceSettings, crc32_hex, pack, unpack,
+    CAPABILITIES, MAX_BUNDLE, AppendageNight, Appendages, AppliedSettings, NightCap, NightSettings, RobotPower, RobotSettings, RobotConfigSource, RobotStatus,
+    TouchFeed, TouchSpots, VoiceSettings, crc32_hex, pack, unpack,
 )
 
 # A real /api/status, 7 Nov 2026, with the token-free fields as they came.
@@ -47,7 +48,7 @@ def test_status_parses_strictly():
     s = from_dict(STATUS, RobotStatus, strict=True)
     assert s.settings.applied.volume == 70 and s.settings.night is None
     assert s.led(2) == (0x43, 0x15, 0x30) and s.led(0) == (0, 0, 0)
-    assert to_dict(s) == STATUS
+    assert to_dict(s) == {**STATUS, "power": None}   # this status is from before the firmware had a power block
 
 
 def test_an_unknown_status_key_is_drift_when_strict_and_dropped_when_not():
@@ -60,6 +61,32 @@ def test_settings_with_a_night_cap():
     s = from_dict({"dimmer": 50, "volume": 70, "brightness": 75, "night": {"dimmer": 10, "volume": 20, "brightness": 30},
                    "applied": {"dimmer": 10, "volume": 20, "brightness": 30}}, RobotSettings, strict=True)
     assert s.night == NightCap(10, 20, 30) and s.applied == AppliedSettings(10, 20, 30)
+    assert s.night.light == 100                     # a firmware from before appendages says nothing: no ceiling
+
+
+def test_a_night_cap_carries_the_appendage_lights_ceiling():
+    s = from_dict({"dimmer": 50, "volume": 70, "brightness": 75,
+                   "night": {"dimmer": 10, "volume": 20, "brightness": 30, "light": 28},
+                   "applied": {"dimmer": 10, "volume": 20, "brightness": 30}}, RobotSettings, strict=True)
+    assert s.night == NightCap(10, 20, 30, 28)
+    assert to_dict(NightCap(10, 20, 30, 28))["light"] == 28
+    assert NightSettings().light == 28
+
+
+# A "power" block in the firmware's shape and words. The battery, USB, temperature and current
+# figures are a charging robot's; the rest are stand-ins, not a capture.
+POWER = {"batteryMv": 4105, "usbMv": 4810, "systemMv": 4172, "chipTempC": 61.5, "usbGood": True,
+         "batteryPresent": True, "inputLimited": False, "direction": "charging", "phase": "constant current",
+         "raw": "2a22100900000012ca104c0b", "monitorMv": 4091, "monitorMa": -681.0}
+
+
+def test_status_carries_the_power_chips_readings_when_it_has_them():
+    s = from_dict({**STATUS, "power": POWER}, RobotStatus, strict=True)
+    assert s.power.batteryMv == 4105 and s.power.monitorMa == -681.0 and not s.power.inputLimited
+    bare = from_dict({**STATUS, "power": {k: v for k, v in POWER.items() if not k.startswith("monitor")}},
+                     RobotStatus, strict=True)
+    assert bare.power.monitorMa is None             # a body with no battery monitor of its own
+    assert from_dict(STATUS, RobotStatus, strict=True).power is None
 
 
 def test_touch_spots_with_and_without_head():
@@ -120,7 +147,7 @@ def test_robot_client_sends_its_token_and_reads_settings():
     assert st.face == "studio" and s.dimmer == 100
     assert all(h == "tok" for _, _, h, _ in seen)
     assert seen[1][1:] == ("/api/settings", "tok", {"dimmer": 40})
-    assert seen[2][3] == {"night": {"dimmer": 10, "volume": 20, "brightness": 30}}
+    assert seen[2][3] == {"night": {"dimmer": 10, "volume": 20, "brightness": 30, "light": 100}}
     assert seen[3][3] == {"night": None}
     assert seen[4][1:] == ("/api/head", "tok", {"speed": 150, "yaw": 30})      # pitch left where it is
 
@@ -201,8 +228,11 @@ def test_every_key_the_firmware_sends_is_a_field():
     assert _keys(settings, "root") == {"settings", "config"}
     assert _keys(settings, "c") == fields(RobotConfigSource)
     assert _keys(settings, "s") <= fields(RobotSettings), _keys(settings, "s") - fields(RobotSettings)
-    assert _keys(settings, "n") == fields(NightCap)
+    # appendages: the night map by name. GOING-TO: the firmware that reads it comes in the same deploy
+    # that drops `light`; until then it's the one field here the firmware doesn't send yet.
+    assert _keys(settings, "n") == fields(NightCap) - {"appendages"}
     assert _keys(settings, "a") == fields(AppliedSettings)
+    assert _keys(status, "power") == fields(RobotPower), _keys(status, "power") ^ fields(RobotPower)
 
 
 @pytest.mark.skipif(not VOICE.exists(), reason="no SerenSoma checkout beside this one")
@@ -434,3 +464,84 @@ def test_what_the_voice_server_sends_for_heard_and_talk_are_fields():
     assert set(re.findall(r'"(\w+)":', line)) == set(HeardLine.__dataclass_fields__)
     talk = src[src.index("def talk_state"):src.index("async def talk_get")]
     assert set(re.findall(r'"(\w+)":', talk)) == set(TalkState.__dataclass_fields__)
+
+
+# ── appendages ──────────────────────────────────────────────────────────────
+
+# GET /api/appendages in the first slice's shape (firmware 0.0.0-dev.1119.1251), keys as
+# hal_appendages.cpp adds them; the numbers are a level-20 light, not a capture.
+APPENDAGES_FIRST_SLICE = {"ok": True, "appendages": [
+    {"name": "light", "kind": "flashlight", "pins": {"en": 9}, "ok": True,
+     "state": {"on": True, "level": 20, "steady": False, "lightPercent": 1.6, "onPercent": 0.9, "hz": 236,
+               "pulseUs": 86, "msLeft": 41},
+     "actions": ["on", "off", "level", "chop"]},
+]}
+
+# The same robot once appendage files are built: a pwm light, an i2c fan, and one refused.
+APPENDAGES = {"ok": True, "kinds": ["switch", "pwm", "i2c", "button", "llm"], "appendages": [
+    {"name": "light", "kind": "pwm", "ok": True, "provides": ["light"], "pins": {"en": 9},
+     "file": "m5-flashlight-u152", "actions": ["on", "off", "level"],
+     "state": {"on": False, "msLeft": 0}, "night": {"default": 28, "holding": 28}},
+    {"name": "fan", "kind": "i2c", "ok": True, "provides": ["airflow"], "pins": {},
+     "file": "m5-module-fan-v11", "actions": ["on", "off", "level"],
+     "state": {"on": True, "level": 20, "asked": 30, "msLeft": 290000, "rpm": 3720},
+     "night": {"default": 20, "holding": 20}},
+    {"name": "lamp2", "kind": "pwm", "ok": False, "provides": ["light", "smoke"], "pins": {"en": 9},
+     "error": "pin 9 is claimed by light too; both are refused"},
+]}
+
+
+def test_the_first_slices_appendages_parse_strictly():
+    a = from_dict(APPENDAGES_FIRST_SLICE, Appendages, strict=True)
+    light = a.appendages[0]
+    assert light.ok and light.pins == {"en": 9} and light.state.level == 20
+    assert light.state.extra["lightPercent"] == 1.6     # a kind's own readings ride in extra
+    assert light.provides == [] and a.providing("light") is None   # the first slice says nothing it provides
+
+
+def test_appendages_are_found_by_what_they_provide_not_by_name():
+    a = from_dict(APPENDAGES, Appendages, strict=True)
+    assert a.providing("light").name == "light"
+    assert a.providing("airflow").name == "fan" and a.providing("airflow").state.extra == {"rpm": 3720}
+    assert a.providing("smoke") is None                  # only lamp2 says smoke, and it was refused
+    assert a.providing("light", prefer="lamp2").name == "light"   # a refused one is never picked
+    assert a.appendages[1].state.asked == 30             # the night ceiling held the fan at 20
+    assert "light" in CAPABILITIES and "smoke" not in CAPABILITIES
+
+
+def test_every_appendage_that_takes_a_ceiling_is_listed_with_its_default():
+    c = from_dict(APPENDAGES, Appendages, strict=True).ceilings()
+    assert c == {"light": AppendageNight(28, 28), "fan": AppendageNight(20, 20)}
+
+
+def test_night_ceilings_go_by_appendage_name():
+    cap = NightCap(10, 20, 30, appendages={"light": 28, "fan": 20})
+    assert to_dict(cap)["appendages"] == {"light": 28, "fan": 20}
+    s = from_dict({"dimmer": 50, "volume": 70, "brightness": 75,
+                   "night": {"dimmer": 10, "volume": 20, "brightness": 30, "appendages": {"fan": 20}},
+                   "applied": {"dimmer": 10, "volume": 20, "brightness": 30}}, RobotSettings, strict=True)
+    assert s.night.appendages == {"fan": 20} and s.night.light == 100
+    assert NightSettings().appendages == {}               # nobody set one: each holds its file's default
+    v = from_dict({"night": {"appendages": {"light": 32}}}, VoiceSettings, strict=True)
+    assert v.night.appendages == {"light": 32}
+
+
+def test_robot_client_reads_appendages_and_runs_an_action():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, json.loads(request.content or b"null")))
+        if request.method == "GET":
+            return httpx.Response(200, json=APPENDAGES)
+        return httpx.Response(200, json={"ok": True, "name": "fan", "state": {"on": True, "level": 20}})
+
+    async def go():
+        from seren_sinew.soma.client import SomaRobot
+        robot = SomaRobot("http://bot:8080", "tok", transport=httpx.MockTransport(handler))
+        got = await robot.appendages(), await robot.appendage("fan", "level", level=20, ms=60000)
+        await robot.aclose()
+        return got
+
+    a, answer = _run(go())
+    assert a.providing("airflow").name == "fan" and answer["state"]["level"] == 20
+    assert seen[1] == ("POST", "/api/appendages/fan", {"action": "level", "level": 20, "ms": 60000})

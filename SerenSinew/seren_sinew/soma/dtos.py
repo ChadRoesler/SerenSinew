@@ -23,10 +23,20 @@ from typing import Any, Optional
 @dataclass
 class NightCap:
     """A cap over the day's settings, while it's night. Never saved on the robot:
-    the voice server sends it again every minute."""
+    the voice server sends it again every minute.
+
+    appendages   a ceiling per appendage, by its name: {"light": 28, "fan": 20}, level 1~100.
+                 A name the robot hasn't got is ignored. An appendage left out holds the
+                 default its own file declares, never "uncapped": only one whose file has
+                 no ``night:`` runs without a ceiling (docs/appendages.md, "Night ceilings").
+    light        the first slice's one flashlight ceiling (19 Nov 2026), until the firmware
+                 reads ``appendages``. GOING: it leaves in the same deploy as the firmware
+                 that reads the map, so the flashlight is never without a night limit."""
     dimmer: int = 100
     volume: int = 100
     brightness: int = 100
+    light: int = 100
+    appendages: Optional[dict[str, int]] = None
 
 
 @dataclass
@@ -62,9 +72,40 @@ class RobotConfigSource:
 
 
 @dataclass
+class RobotPower:
+    """``power`` in GET /api/status: what the power chip measures, read on each call.
+
+    The percentage in ``batteryLevel`` is the chip's own gauge and loses its count
+    whenever the battery is unplugged; the voltages here do not.
+
+    direction    which way current flows at the chip: its own word for it. It has said
+                 "charging" while the battery was losing 170 mA overall (19 Nov 2026, fed
+                 through the base's USB port), so for "is the battery gaining" read monitorMa.
+    phase        the charger's phase: its own word for it.
+    inputLimited the chip is holding the charge back because the input sags.
+    raw          the status and measurement bytes the numbers were decoded from, hex.
+    monitorMv, monitorMa   a body with its own battery monitor: the battery's voltage
+                 and current there. Negative is into the battery. Absent without one.
+    """
+    batteryMv: int = 0
+    usbMv: int = 0
+    systemMv: int = 0
+    chipTempC: float = 0.0
+    usbGood: bool = False
+    batteryPresent: bool = False
+    inputLimited: bool = False
+    direction: str = ""
+    phase: str = ""
+    raw: str = ""
+    monitorMv: Optional[int] = None
+    monitorMa: Optional[float] = None
+
+
+@dataclass
 class RobotStatus:
     """GET /api/status. Most keys are there only when they mean something: ``rig``
-    and ``resting`` with a sprite face, ``facePush`` after a face was sent."""
+    and ``resting`` with a sprite face, ``facePush`` after a face was sent, ``power``
+    when the power chip answered."""
     ok: bool = False
     firmware: str = ""
     uptimeMs: int = 0
@@ -77,6 +118,7 @@ class RobotStatus:
     twitches: Optional[int] = None
     settings: Optional[RobotSettings] = None
     config: Optional[RobotConfigSource] = None   # firmware 0.2.0 on
+    power: Optional[RobotPower] = None
     batteryLevel: int = 0
     charging: bool = False
     freeInternalHeap: int = 0
@@ -126,18 +168,104 @@ class TouchSpots:
     buildups: Optional[dict[str, Buildup]] = None
 
 
+# ── appendages: anything bolted onto the StackChan ─────────────────────────
+#
+# The StackChan itself (servos, rails, head touch, screen, camera, power, light sensor) has named,
+# typed shapes above. Anything bolted on is a file (<name>.appendage.yaml, docs/appendages.md):
+# a generic kind in the firmware (switch, pwm, i2c, button, llm) filled in by that file. So these
+# shapes know kinds and capabilities, never parts: nothing in Sinew knows what a flashlight is.
+
+# The capability words gestures understand, and what each one promises. Any other word in a file's
+# ``provides`` is allowed and ignored, so a friend can ship ``provides: [smoke]`` without asking.
+CAPABILITIES: dict[str, str] = {
+    "light": "on, off and a timed limit; with 'level', 1~100 is a share of that light's own full "
+             "output, the same scale on every light (level 1 is 0.6%)",
+    "airflow": "on, off and a timed limit; with 'level', 1~100 is a share of full speed",
+}
+
+
+@dataclass
+class AppendageNight:
+    """``night`` on an appendage whose file declares one: the ceiling its file asks for when nobody
+    has set one (``default``), and the one it is holding right now (``holding``; 100 by day)."""
+    default: int = 100
+    holding: int = 100
+
+
+@dataclass
+class AppendageState:
+    """``state`` on an appendage. OPEN: what a kind reports beyond these rides in ``extra``
+    (a pwm light's lightPercent, hz and pulseUs, an i2c fan's rpm, a button's lastPress)."""
+    on: bool = False
+    level: Optional[int] = None    # what it runs at
+    asked: Optional[int] = None    # what was asked, when a night ceiling held it lower
+    msLeft: int = 0                # until it switches itself off; every on ends by itself
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Appendage:
+    """One entry of GET /api/appendages. ``ok`` false means the robot refused it (a pin clash, a base
+    pin, a kind this firmware hasn't got) and ``error`` says why in plain words; the robot still boots.
+
+    kind       the firmware driver: switch, pwm, i2c, button, llm
+    provides   capability words (CAPABILITIES); [] from a file that says none
+    pins       by role, as the file names them: {"en": 9}
+    actions    what POST /api/appendages/<name> takes: {"action": one of these, ...}
+    file       the catalogue or import it came from, "m5-flashlight-u152"; absent on the first slice"""
+    name: str = ""
+    kind: str = ""
+    ok: bool = False
+    provides: list[str] = field(default_factory=list)
+    pins: dict[str, int] = field(default_factory=dict)
+    actions: list[str] = field(default_factory=list)
+    state: Optional[AppendageState] = None
+    night: Optional[AppendageNight] = None
+    error: Optional[str] = None
+    file: Optional[str] = None
+    side: Optional[str] = None     # the first slice's flashlight: which side of the head. GOING with it
+
+    def can(self, word: str) -> bool:
+        return word in self.provides
+
+
+@dataclass
+class Appendages:
+    """GET /api/appendages: what is attached, and the kinds this firmware carries (so an import can say
+    "needs a firmware with i2c" instead of half-working)."""
+    ok: bool = False
+    appendages: list[Appendage] = field(default_factory=list)
+    kinds: list[str] = field(default_factory=list)
+
+    def providing(self, word: str, *, prefer: Optional[str] = None) -> Optional[Appendage]:
+        """The working appendage that provides ``word``: the one named ``prefer`` if it does, else the
+        first in the robot's list. How a gesture finds "a light" without naming one."""
+        able = [a for a in self.appendages if a.ok and a.can(word)]
+        return next((a for a in able if a.name == prefer), able[0] if able else None)
+
+    def ceilings(self) -> dict[str, AppendageNight]:
+        """Every appendage that takes a night ceiling, by name: what a Night card draws a slider for."""
+        return {a.name: a.night for a in self.appendages if a.ok and a.night is not None}
+
+
 # ── the voice server ───────────────────────────────────────────────────────
 
 @dataclass
 class NightSettings:
     """The bedroom: from start to end (HH:MM, crossing midnight is fine) the
-    robot's lights, speaker and screen are capped at these."""
+    robot's lights, speaker and screen are capped at these, and each appendage's
+    level at its entry in ``appendages``, by name. Only the ones someone has set are
+    here; the rest hold their file's own default on the robot.
+
+    light: the first slice's flashlight ceiling. GOING, with NightCap.light."""
     enabled: bool = False
     start: str = "22:30"
     end: str = "07:00"
     dimmer: int = 15
     volume: int = 30
     brightness: int = 20
+    light: int = 28
+    appendages: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

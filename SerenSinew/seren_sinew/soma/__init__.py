@@ -27,6 +27,11 @@ from __future__ import annotations
 
 from .bundle import MAX_BUNDLE, crc32_hex, pack, unpack  # noqa: F401
 from .dtos import (  # noqa: F401
+    CAPABILITIES,
+    Appendage,
+    AppendageNight,
+    Appendages,
+    AppendageState,
     AppliedSettings,
     Buildup,
     ChannelSettings,
@@ -37,6 +42,7 @@ from .dtos import (  # noqa: F401
     NightCap,
     NightSettings,
     RobotConfigSource,
+    RobotPower,
     RobotSettings,
     RobotStatus,
     TalkState,
@@ -49,8 +55,10 @@ from .dtos import (  # noqa: F401
 )
 
 __all__ = [
+    "CAPABILITIES", "Appendage", "AppendageNight", "AppendageState", "Appendages",
     "AppliedSettings", "Buildup", "ChannelSettings", "HandState", "HeadTouch", "Heard", "HeardLine", "MAX_BUNDLE",
-    "NightCap", "NightSettings", "RobotConfigSource", "RobotSettings", "RobotStatus", "TalkState", "TouchEvent",
+    "NightCap", "NightSettings", "RobotConfigSource", "RobotPower", "RobotSettings", "RobotStatus", "TalkState",
+    "TouchEvent",
     "TouchFeed", "TouchSpots",
     "VoiceSettings", "VoiceStatus", "WorkHours", "crc32_hex", "pack", "unpack",
 ]

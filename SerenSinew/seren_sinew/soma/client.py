@@ -23,7 +23,7 @@ import httpx
 
 from ..cluster.dtos import from_dict, to_dict
 from .bundle import crc32_hex
-from .dtos import (Heard, NightCap, RobotSettings, RobotStatus, TalkState, TouchFeed, TouchSpots, VoiceSettings,
+from .dtos import (Appendages, Heard, NightCap, RobotSettings, RobotStatus, TalkState, TouchFeed, TouchSpots, VoiceSettings,
                    VoiceStatus)
 
 
@@ -97,8 +97,18 @@ class SomaRobot:
     async def night(self, cap: Optional[NightCap]) -> RobotSettings:
         """Puts a night cap on, or takes it off with None. Never saved: the voice
         server owns night and sends it again every minute."""
-        body = {"night": to_dict(cap) if cap is not None else None}
+        night = None if cap is None else {k: v for k, v in to_dict(cap).items() if v is not None}
+        body = {"night": night}   # no map: each appendage holds its own file's default
         return from_dict((await self._post("settings", body))["settings"], RobotSettings)
+
+    async def appendages(self) -> Appendages:
+        """What is bolted on, its state and night ceilings, and the kinds this firmware carries."""
+        return from_dict(await self._get("appendages"), Appendages)
+
+    async def appendage(self, name: str, action: str, **args: Any) -> dict[str, Any]:
+        """Runs one of an appendage's actions ({"action": ..., **args}, e.g. level=20, ms=60000). The
+        answer is the kind's own; a refused action raises with the robot's reason."""
+        return await self._post(f"appendages/{name}", {"action": action, **args})
 
     async def touch_spots(self) -> TouchSpots:
         return from_dict(await self._get("touch-spots"), TouchSpots)
