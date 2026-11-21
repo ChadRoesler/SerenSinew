@@ -7,17 +7,29 @@ starting a command AS a person from a root / LocalSystem service - the ripple
 that wakes the model. `cluster` (seren_sinew.cluster): the head-to-node wire
 spelled once - the DTOs, the node client and discovery that Lodestar and the
 Observatory used to spell separately (28 Oct 2026).
+
+THE FRONT DOOR IS STANDARD LIBRARY ONLY. Importing this package, or any part of it
+that says it is stdlib only (``seren_sinew.soma.dtos``, ``soma.bundle``,
+``cluster.dtos``), must not pull in starlette or httpx: the Ganglion, our unit on the
+LLM module, has no network to pip from and reads the body's shapes with Python 3.10
+and nothing else (20 Nov 2026). So the request-logging names below load only when
+someone asks for one; ``from seren_sinew import RequestLoggingMiddleware`` still works.
+The 3.10 floor in pyproject is the module's Python: raise it and the Ganglion falls off.
 """
 from __future__ import annotations
 
-from .request_log import (
-    RequestLoggingMiddleware,
-    current_request_id,
-    get_logger,
-    request_id_hooks,
-    request_id_scope,
-    setup_request_logger,
-)
+from typing import Any
+
+_REQUEST_LOG = ("RequestLoggingMiddleware", "current_request_id", "get_logger",
+                "request_id_hooks", "request_id_scope", "setup_request_logger")
+
+
+def __getattr__(name: str) -> Any:
+    if name in _REQUEST_LOG:
+        from . import request_log
+        return getattr(request_log, name)
+    raise AttributeError(f"module 'seren_sinew' has no attribute {name!r}")
+
 
 try:  # the setuptools-scm build artifact (gitignored); present in installed wheels
     from ._version import version as __version__
